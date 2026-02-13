@@ -225,6 +225,12 @@ function normalizeOpenzaloTarget(rawTarget: string): string {
     const id = aliasMatch[2] ?? "";
     return `${kind}:${id}`;
   }
+  // Accept common display labels like "Name (123456789)" emitted by tooling/UI
+  // and normalize them to direct thread ids.
+  const labeledIdMatch = cleaned.match(/\((\d{3,})\)\s*$/);
+  if (labeledIdMatch?.[1]) {
+    return labeledIdMatch[1];
+  }
   return cleaned;
 }
 

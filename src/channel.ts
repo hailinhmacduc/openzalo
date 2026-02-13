@@ -161,17 +161,35 @@ type OpenzaloActionsConfig = {
   reactions?: boolean;
 };
 
-function parseOpenzaloActionTarget(rawTarget: string): { threadId: string; isGroup: boolean } {
+function normalizeOpenzaloTarget(rawTarget: string): string {
   const cleaned = rawTarget.replace(/^(openzalo|zlu):/i, "").trim();
-  if (cleaned.toLowerCase().startsWith("group:")) {
-    const threadId = cleaned.slice("group:".length).trim();
+  if (!cleaned) {
+    return "";
+  }
+  const lowered = cleaned.toLowerCase();
+  if (lowered.startsWith("group:") || lowered.startsWith("user:")) {
+    return cleaned;
+  }
+  const aliasMatch = cleaned.match(/^([gu])-(\d{3,})$/i);
+  if (aliasMatch) {
+    const kind = aliasMatch[1]?.toLowerCase() === "g" ? "group" : "user";
+    const id = aliasMatch[2] ?? "";
+    return `${kind}:${id}`;
+  }
+  return cleaned;
+}
+
+function parseOpenzaloActionTarget(rawTarget: string): { threadId: string; isGroup: boolean } {
+  const normalized = normalizeOpenzaloTarget(rawTarget);
+  if (normalized.toLowerCase().startsWith("group:")) {
+    const threadId = normalized.slice("group:".length).trim();
     return { threadId, isGroup: true };
   }
-  if (cleaned.toLowerCase().startsWith("user:")) {
-    const threadId = cleaned.slice("user:".length).trim();
+  if (normalized.toLowerCase().startsWith("user:")) {
+    const threadId = normalized.slice("user:".length).trim();
     return { threadId, isGroup: false };
   }
-  return { threadId: cleaned, isGroup: false };
+  return { threadId: normalized, isGroup: false };
 }
 
 function readActionMessageField(params: Record<string, unknown>, key: string): string | undefined {
@@ -514,7 +532,8 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
       if (!trimmed) {
         return undefined;
       }
-      return trimmed.replace(/^(openzalo|zlu):/i, "");
+      const normalized = normalizeOpenzaloTarget(trimmed);
+      return normalized || undefined;
     },
     targetResolver: {
       looksLikeId: (raw) => {
@@ -525,7 +544,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
         const parsed = parseOpenzaloActionTarget(trimmed);
         return /^\d{3,}$/.test(parsed.threadId);
       },
-      hint: "<threadId|group:threadId|user:threadId>",
+      hint: "<threadId|group:threadId|user:threadId|g-threadId|u-threadId>",
     },
   },
   directory: {

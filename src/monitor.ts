@@ -27,7 +27,11 @@ import type {
 import { getOpenzaloRuntime } from "./runtime.js";
 import { sendMessageOpenzalo, sendTypingOpenzalo } from "./send.js";
 import { parseJsonOutput, runOpenzca, runOpenzcaStreaming } from "./openzca.js";
-import { OPENZALO_DEFAULT_FAILURE_NOTICE_MESSAGE, OPENZALO_TEXT_LIMIT } from "./constants.js";
+import {
+  OPENZALO_DEFAULT_DM_INBOUND_DEBOUNCE_MS,
+  OPENZALO_DEFAULT_FAILURE_NOTICE_MESSAGE,
+  OPENZALO_TEXT_LIMIT,
+} from "./constants.js";
 
 type OpenzaloStatusPatch = {
   lastInboundAt?: number;
@@ -416,6 +420,120 @@ function resolveMediaContext(message: ZcaMessage): ResolvedOpenzaloMediaContext 
     mediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined,
     mediaType: mediaTypes[0],
     mediaTypes: mediaTypes.length > 0 ? mediaTypes : undefined,
+  };
+}
+
+function resolveOpenzaloInboundDebounceMs(
+  config: OpenClawConfig,
+  core: OpenzaloCoreRuntime,
+): number {
+  const inbound = config.messages?.inbound;
+  const hasExplicitDebounce =
+    typeof inbound?.debounceMs === "number" ||
+    typeof inbound?.byChannel?.["openzalo"] === "number";
+  if (!hasExplicitDebounce) {
+    return OPENZALO_DEFAULT_DM_INBOUND_DEBOUNCE_MS;
+  }
+  return core.channel.debounce.resolveInboundDebounceMs({ cfg: config, channel: "openzalo" });
+}
+
+function combineOpenzaloDebouncedMessages(messages: ZcaMessage[]): ZcaMessage {
+  if (messages.length === 0) {
+    throw new Error("Cannot combine empty message batch");
+  }
+  if (messages.length === 1) {
+    return messages[0];
+  }
+
+  const first = messages[0];
+  const last = messages[messages.length - 1];
+
+  const seenBodies = new Set<string>();
+  const bodyParts: string[] = [];
+  for (const message of messages) {
+    const body = normalizeStringValue(message.content);
+    if (!body) {
+      continue;
+    }
+    const normalized = body.toLowerCase();
+    if (seenBodies.has(normalized)) {
+      continue;
+    }
+    seenBodies.add(normalized);
+    bodyParts.push(body);
+  }
+  const mergedBody = bodyParts.join("\n").trim();
+
+  const mediaContexts = messages.map((message) => resolveMediaContext(message));
+  const mediaPaths = collectUniqueStrings(
+    ...mediaContexts.map((context) => context.mediaPaths),
+    ...mediaContexts.map((context) => context.mediaPath),
+  );
+  const mediaUrls = collectUniqueStrings(
+    ...mediaContexts.map((context) => context.mediaUrls),
+    ...mediaContexts.map((context) => context.mediaUrl),
+  );
+  const mediaTypes = collectUniqueStrings(
+    ...mediaContexts.map((context) => context.mediaTypes),
+    ...mediaContexts.map((context) => context.mediaType),
+  );
+  const mentionIds = collectUniqueStrings(
+    ...messages.map((message) => message.mentionIds),
+    ...messages.map((message) => message.metadata?.mentionIds),
+  );
+  const mergedMentions = messages.flatMap((message) => [
+    ...(Array.isArray(message.mentions) ? message.mentions : []),
+    ...(Array.isArray(message.metadata?.mentions) ? message.metadata.mentions : []),
+  ]);
+
+  const mergedTimestamp = messages.reduce((latest, message) => {
+    if (
+      typeof message.timestamp === "number" &&
+      Number.isFinite(message.timestamp) &&
+      message.timestamp > latest
+    ) {
+      return message.timestamp;
+    }
+    return latest;
+  }, 0);
+  const mergedMsgId = [...messages]
+    .reverse()
+    .map((message) => normalizeStringValue(message.msgId))
+    .find((value): value is string => Boolean(value));
+  const mergedCliMsgId = [...messages]
+    .reverse()
+    .map((message) => normalizeStringValue(message.cliMsgId))
+    .find((value): value is string => Boolean(value));
+
+  return {
+    ...first,
+    ...last,
+    content: mergedBody || last.content || first.content,
+    timestamp: mergedTimestamp > 0 ? mergedTimestamp : last.timestamp,
+    msgId: mergedMsgId ?? last.msgId,
+    cliMsgId: mergedCliMsgId ?? last.cliMsgId,
+    mediaPath: mediaPaths[0],
+    mediaPaths: mediaPaths.length > 0 ? mediaPaths : undefined,
+    mediaUrl: mediaUrls[0],
+    mediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined,
+    mediaType: mediaTypes[0],
+    mediaTypes: mediaTypes.length > 0 ? mediaTypes : undefined,
+    mentionIds: mentionIds.length > 0 ? mentionIds : undefined,
+    mentions: mergedMentions.length > 0 ? mergedMentions : undefined,
+    metadata: {
+      ...first.metadata,
+      ...last.metadata,
+      mediaPath: mediaPaths[0],
+      mediaPaths: mediaPaths.length > 0 ? mediaPaths : undefined,
+      mediaUrl: mediaUrls[0],
+      mediaUrls: mediaUrls.length > 0 ? mediaUrls : undefined,
+      mediaType: mediaTypes[0],
+      mediaTypes: mediaTypes.length > 0 ? mediaTypes : undefined,
+      mentionIds: mentionIds.length > 0 ? mentionIds : undefined,
+      mentionCount:
+        mentionIds.length > 0 ? mentionIds.length : (last.metadata?.mentionCount ?? undefined),
+      mentions: mergedMentions.length > 0 ? mergedMentions : last.metadata?.mentions,
+    },
   };
 }
 
@@ -1310,7 +1428,7 @@ export async function monitorOpenzaloProvider(
   const humanPassSessions = new Set<string>();
   const groupHistories = new Map<string, HistoryEntry[]>();
   const historyLimit = resolveOpenzaloHistoryLimit({ config, account });
-  const conversationLanes = new Map<string, Promise<void>>();
+  const groupConversationLanes = new Map<string, Promise<void>>();
   const botUserId = await resolveOpenzcaUserId(account.profile, runtime);
   if (botUserId) {
     logVerbose(core, runtime, `[${account.accountId}] resolved bot user id=${botUserId}`);
@@ -1322,6 +1440,101 @@ export async function monitorOpenzaloProvider(
     );
   }
   logVerbose(core, runtime, `[${account.accountId}] group history limit=${historyLimit}`);
+  const dmInboundDebounceMs = resolveOpenzaloInboundDebounceMs(config, core);
+  logVerbose(core, runtime, `[${account.accountId}] dm inbound debounce=${dmInboundDebounceMs}ms`);
+
+  const processInboundMessage = async (msg: ZcaMessage): Promise<void> => {
+    await processMessage(
+      msg,
+      account,
+      config,
+      core,
+      runtime,
+      botUserId,
+      groupHistories,
+      historyLimit,
+      statusSink,
+      mentionDetectionFailureWarnings,
+      humanPassSessions,
+      recordMetric,
+    );
+  };
+
+  const enqueueGroupMessage = (msg: ZcaMessage): void => {
+    const threadId = normalizeStringValue(msg.threadId) ?? "unknown";
+    const laneKey = `${account.accountId}:${threadId}`;
+    const hasPending = groupConversationLanes.has(laneKey);
+    if (hasPending) {
+      logVerbose(core, runtime, `[${account.accountId}] queue inbound lane=${laneKey}`);
+    }
+    const previous = groupConversationLanes.get(laneKey) ?? Promise.resolve();
+    const next = previous
+      .catch(() => undefined)
+      .then(async () => {
+        logVerbose(core, runtime, `[${account.accountId}] inbound message lane=${laneKey}`);
+        await processInboundMessage(msg);
+      })
+      .catch((err) => {
+        runtime.error(`[${account.accountId}] Failed to process message: ${String(err)}`);
+      })
+      .finally(() => {
+        if (groupConversationLanes.get(laneKey) === next) {
+          groupConversationLanes.delete(laneKey);
+        }
+      });
+    groupConversationLanes.set(laneKey, next);
+  };
+
+  const dmInboundDebouncer = core.channel.debounce.createInboundDebouncer<ZcaMessage>({
+    debounceMs: dmInboundDebounceMs,
+    buildKey: (message) => {
+      if (inferIsGroupMessage(message)) {
+        return null;
+      }
+      const threadId = normalizeStringValue(message.threadId) ?? "unknown";
+      const senderId =
+        normalizeStringValue(message.metadata?.fromId) ??
+        normalizeStringValue(message.metadata?.senderId) ??
+        normalizeStringValue(message.senderId) ??
+        threadId;
+      return `openzalo:${account.accountId}:dm:${threadId}:sender:${senderId}`;
+    },
+    shouldDebounce: (message) => {
+      if (inferIsGroupMessage(message)) {
+        return false;
+      }
+      const body = normalizeStringValue(message.content) ?? "";
+      if (!body) {
+        return true;
+      }
+      if (parseHumanPassCommand(body)) {
+        return false;
+      }
+      if (core.channel.commands.isControlCommandMessage(body, config)) {
+        return false;
+      }
+      return true;
+    },
+    onFlush: async (messages) => {
+      if (messages.length === 0) {
+        return;
+      }
+      const merged =
+        messages.length > 1 ? combineOpenzaloDebouncedMessages(messages) : messages[0];
+      if (messages.length > 1) {
+        const threadId = normalizeStringValue(merged.threadId) ?? "unknown";
+        logVerbose(
+          core,
+          runtime,
+          `[${account.accountId}] coalesced ${messages.length} DM events thread=${threadId}`,
+        );
+      }
+      await processInboundMessage(merged);
+    },
+    onError: (err) => {
+      runtime.error(`[${account.accountId}] openzalo DM debounce flush failed: ${String(err)}`);
+    },
+  });
 
   const stop = () => {
     stopped = true;
@@ -1333,7 +1546,7 @@ export async function monitorOpenzaloProvider(
       proc.kill("SIGTERM");
       proc = null;
     }
-    conversationLanes.clear();
+    groupConversationLanes.clear();
     resolveRunning?.();
   };
 
@@ -1354,41 +1567,13 @@ export async function monitorOpenzaloProvider(
       account.profile,
       (msg) => {
         statusSink?.({ lastInboundAt: Date.now() });
-        const threadId = normalizeStringValue(msg.threadId) ?? "unknown";
-        const laneKey = `${account.accountId}:${threadId}`;
-        const hasPending = conversationLanes.has(laneKey);
-        if (hasPending) {
-          logVerbose(core, runtime, `[${account.accountId}] queue inbound lane=${laneKey}`);
+        if (inferIsGroupMessage(msg)) {
+          enqueueGroupMessage(msg);
+          return;
         }
-        const previous = conversationLanes.get(laneKey) ?? Promise.resolve();
-        const next = previous
-          .catch(() => undefined)
-          .then(async () => {
-            logVerbose(core, runtime, `[${account.accountId}] inbound message lane=${laneKey}`);
-            await processMessage(
-              msg,
-              account,
-              config,
-              core,
-              runtime,
-              botUserId,
-              groupHistories,
-              historyLimit,
-              statusSink,
-              mentionDetectionFailureWarnings,
-              humanPassSessions,
-              recordMetric,
-            );
-          })
-          .catch((err) => {
-            runtime.error(`[${account.accountId}] Failed to process message: ${String(err)}`);
-          })
-          .finally(() => {
-            if (conversationLanes.get(laneKey) === next) {
-              conversationLanes.delete(laneKey);
-            }
-          });
-        conversationLanes.set(laneKey, next);
+        void dmInboundDebouncer.enqueue(msg).catch((err) => {
+          runtime.error(`[${account.accountId}] Failed to enqueue DM message: ${String(err)}`);
+        });
       },
       (err) => {
         runtime.error(`[${account.accountId}] openzca listener error: ${String(err)}`);

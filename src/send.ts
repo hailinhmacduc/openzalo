@@ -23,6 +23,11 @@ export type OpenzaloActionResult = {
   error?: string;
 };
 
+const MEDIA_SEND_TIMEOUT_MS = 120000;
+const VIDEO_EXTENSIONS = /\.(mp4|mov|avi|webm|mkv)$/i;
+const AUDIO_EXTENSIONS = /\.(aac|mp3|wav|ogg|m4a|flac)$/i;
+const IMAGE_EXTENSIONS = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif|avif)$/i;
+
 function resolveMaxChars(options: OpenzaloSendOptions): number {
   const candidate = options.maxChars;
   if (typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0) {
@@ -146,15 +151,18 @@ async function sendMediaOpenzalo(
     return { ok: false, error: "No media URL provided" };
   }
 
-  // Determine media type from URL
-  const lowerUrl = mediaUrl.toLowerCase();
-  let command: string;
-  if (lowerUrl.match(/\.(mp4|mov|avi|webm)$/)) {
+  const trimmedMedia = mediaUrl.trim();
+  const lowerUrl = trimmedMedia.toLowerCase();
+  let command: "video" | "voice" | "image" | "upload";
+  if (VIDEO_EXTENSIONS.test(lowerUrl)) {
     command = "video";
-  } else if (lowerUrl.match(/\.(mp3|wav|ogg|m4a)$/)) {
+  } else if (AUDIO_EXTENSIONS.test(lowerUrl)) {
     command = "voice";
-  } else {
+  } else if (IMAGE_EXTENSIONS.test(lowerUrl)) {
     command = "image";
+  } else {
+    // Generic files (.xlsx/.pdf/.zip/...) must use msg upload instead of msg image.
+    command = "upload";
   }
 
   const mediaSizeError = await checkLocalFileSizeWithinLimit(mediaUrl, options.maxBytes);
@@ -162,8 +170,11 @@ async function sendMediaOpenzalo(
     return { ok: false, error: mediaSizeError };
   }
 
-  const args = ["msg", command, threadId.trim(), "-u", mediaUrl.trim()];
-  if (options.caption) {
+  const args =
+    command === "upload"
+      ? ["msg", "upload", trimmedMedia, threadId.trim()]
+      : ["msg", command, threadId.trim(), "-u", trimmedMedia];
+  if (command !== "upload" && options.caption) {
     args.push("-m", clampText(options.caption, options));
   }
   if (options.isGroup) {
@@ -171,13 +182,31 @@ async function sendMediaOpenzalo(
   }
 
   try {
-    const result = await runOpenzca(args, { profile });
+    const result = await runOpenzca(args, { profile, timeout: MEDIA_SEND_TIMEOUT_MS });
 
     if (result.ok) {
+      // msg upload has no caption flag; send caption as a follow-up text for file uploads.
+      if (command === "upload" && options.caption) {
+        const captionResult = await runOpenzca(
+          ["msg", "send", threadId.trim(), clampText(options.caption, options), ...(options.isGroup ? ["-g"] : [])],
+          { profile, timeout: MEDIA_SEND_TIMEOUT_MS },
+        );
+        if (!captionResult.ok) {
+          return {
+            ok: false,
+            error: captionResult.stderr || "File sent but failed to send caption",
+          };
+        }
+      }
       return { ok: true, messageId: extractMessageId(result.stdout) };
     }
 
-    return { ok: false, error: result.stderr || `Failed to send ${command}` };
+    return {
+      ok: false,
+      error:
+        result.stderr ||
+        (command === "upload" ? "Failed to upload file" : `Failed to send ${command}`),
+    };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
@@ -202,7 +231,7 @@ export async function sendImageOpenzalo(
   }
 
   try {
-    const result = await runOpenzca(args, { profile });
+    const result = await runOpenzca(args, { profile, timeout: MEDIA_SEND_TIMEOUT_MS });
     if (result.ok) {
       return { ok: true, messageId: extractMessageId(result.stdout) };
     }

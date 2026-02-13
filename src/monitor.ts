@@ -7,7 +7,6 @@ import type {
 import {
   createReplyPrefixOptions,
   createTypingCallbacks,
-  DEFAULT_GROUP_HISTORY_LIMIT,
   logTypingFailure,
   mergeAllowlist,
   resolveChannelMediaMaxBytes,
@@ -250,6 +249,117 @@ function parseHumanPassCommand(raw: string): HumanPassCommand | null {
     return "off";
   }
   return null;
+}
+
+type OpenzaloMentionSegment = {
+  pos?: number;
+  len?: number;
+  text?: string;
+};
+
+function collectBotMentionSegments(message: ZcaMessage, botUserId?: string): OpenzaloMentionSegment[] {
+  const normalizedBotUserId = normalizeMentionUid(botUserId);
+  if (!normalizedBotUserId) {
+    return [];
+  }
+
+  const out: OpenzaloMentionSegment[] = [];
+  const collect = (value: unknown): void => {
+    if (!Array.isArray(value)) {
+      return;
+    }
+    for (const item of value) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const row = item as { uid?: unknown; pos?: unknown; len?: unknown; text?: unknown };
+      const uid = normalizeMentionUid(row.uid);
+      if (uid !== normalizedBotUserId) {
+        continue;
+      }
+      const pos =
+        typeof row.pos === "number" && Number.isFinite(row.pos) && row.pos >= 0
+          ? Math.trunc(row.pos)
+          : undefined;
+      const len =
+        typeof row.len === "number" && Number.isFinite(row.len) && row.len > 0
+          ? Math.trunc(row.len)
+          : undefined;
+      out.push({
+        pos,
+        len,
+        text: normalizeStringValue(row.text),
+      });
+    }
+  };
+
+  collect(message.mentions);
+  collect(message.metadata?.mentions);
+  return out;
+}
+
+function stripBotMentionsFromBody(params: {
+  rawBody: string;
+  message: ZcaMessage;
+  botUserId?: string;
+}): string {
+  const segments = collectBotMentionSegments(params.message, params.botUserId);
+  if (segments.length === 0) {
+    return params.rawBody.trim();
+  }
+
+  let output = params.rawBody;
+  const ranges = segments
+    .filter(
+      (segment): segment is { pos: number; len: number; text?: string } =>
+        typeof segment.pos === "number" && typeof segment.len === "number",
+    )
+    .sort((a, b) => b.pos - a.pos);
+  for (const range of ranges) {
+    if (range.pos >= output.length) {
+      continue;
+    }
+    const end = Math.min(output.length, range.pos + range.len);
+    output = `${output.slice(0, range.pos)} ${output.slice(end)}`;
+  }
+  for (const segment of segments) {
+    const token = segment.text?.trim();
+    if (!token) {
+      continue;
+    }
+    output = output.split(token).join(" ");
+  }
+  return output.replace(/\s+/g, " ").trim();
+}
+
+function resolveControlCommandBody(params: {
+  rawBody: string;
+  message: ZcaMessage;
+  botUserId?: string;
+  wasMentionedByUid: boolean;
+}): string {
+  const stripped = stripBotMentionsFromBody({
+    rawBody: params.rawBody,
+    message: params.message,
+    botUserId: params.botUserId,
+  });
+  if (stripped) {
+    return stripped;
+  }
+
+  // Fallback: when explicit mention is known but mention text offsets are unavailable,
+  // attempt to parse command token from first slash.
+  if (params.wasMentionedByUid) {
+    const slashIndex = params.rawBody.indexOf("/");
+    if (slashIndex >= 0) {
+      const candidate = params.rawBody.slice(slashIndex).trim();
+      if (/^\/[a-z]/i.test(candidate)) {
+        return candidate;
+      }
+    }
+  }
+
+  return params.rawBody.trim();
 }
 
 function normalizeMentionUid(value: unknown): string | undefined {
@@ -637,12 +747,12 @@ function resolveOpenzaloHistoryLimit(params: {
   config: OpenClawConfig;
   account: ResolvedOpenzaloAccount;
 }): number {
-  const configured =
-    params.account.config.historyLimit ?? params.config.messages?.groupChat?.historyLimit;
-  if (typeof configured === "number" && Number.isFinite(configured)) {
-    return Math.max(0, Math.floor(configured));
+  const local = params.account.config.historyLimit;
+  if (typeof local === "number" && Number.isFinite(local)) {
+    return Math.max(0, Math.floor(local));
   }
-  return DEFAULT_GROUP_HISTORY_LIMIT;
+  // Default to no automatic group history preload; let agents fetch on demand.
+  return 0;
 }
 
 async function resolveOpenzcaUserId(
@@ -884,13 +994,6 @@ async function processMessage(
     }
   }
 
-  const humanPassCommand = parseHumanPassCommand(rawBody);
-  const isBuiltinControlCommand = core.channel.commands.isControlCommandMessage(rawBody, config);
-  const isControlCommand = isBuiltinControlCommand || humanPassCommand !== null;
-  const canManageHumanPass = commandAuthorized === true || senderAllowedForCommands;
-  const canRunControlCommand =
-    commandAuthorized === true || (humanPassCommand !== null && canManageHumanPass);
-
   const peer = isGroup
     ? { kind: "group" as const, id: chatId }
     : { kind: "direct" as const, id: senderId };
@@ -913,6 +1016,24 @@ async function processMessage(
     canDetectMentionByUid && normalizedBotUserId
       ? mentionIds.includes(normalizedBotUserId)
       : false;
+  const controlCommandBody = isGroup
+    ? resolveControlCommandBody({
+        rawBody,
+        message,
+        botUserId: normalizedBotUserId,
+        wasMentionedByUid,
+      })
+    : rawBody;
+  const humanPassCommand =
+    parseHumanPassCommand(controlCommandBody) ?? parseHumanPassCommand(rawBody);
+  const isBuiltinControlCommand = core.channel.commands.isControlCommandMessage(
+    controlCommandBody || rawBody,
+    config,
+  );
+  const isControlCommand = isBuiltinControlCommand || humanPassCommand !== null;
+  const canManageHumanPass = commandAuthorized === true || senderAllowedForCommands;
+  const canRunControlCommand =
+    commandAuthorized === true || (humanPassCommand !== null && canManageHumanPass);
   const shouldRequireMention = isGroup
       ? core.channel.groups.resolveRequireMention({
           cfg: config,
@@ -956,7 +1077,7 @@ async function processMessage(
     BodyForAgent: rawBody,
     InboundHistory: inboundHistory,
     RawBody: rawBody,
-    CommandBody: rawBody,
+    CommandBody: controlCommandBody || rawBody,
     From: isGroup ? `openzalo:group:${chatId}` : `openzalo:${senderId}`,
     To: `openzalo:${chatId}`,
     SessionKey: route.sessionKey,

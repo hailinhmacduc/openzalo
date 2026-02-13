@@ -101,7 +101,7 @@ channels:
     dmPolicy: pairing # pairing | allowlist | open | disabled
     groupRequireMention: true # require @mention in group chats
     groupMentionDetectionFailure: deny # allow | deny | allow-with-warning
-    historyLimit: 50 # max recent group messages loaded for context on tagged turns
+    historyLimit: 0 # default: no automatic group history preload (agent can fetch on demand)
     sendFailureNotice: true # send fallback message on dispatch failure
     sendFailureMessage: Some problem occurred, could not send a reply.
     textChunkLimit: 2000 # max supported by openzca/openzalo
@@ -137,13 +137,13 @@ If plugin `openzalo` is enabled but `channels.openzalo` is not set in config, ru
 - `groupRequireMention: true`
 - `groupMentionDetectionFailure: deny`
 - `sendFailureNotice: true`
-- `historyLimit: 50`
+- `historyLimit: 0`
 
 Behavior summary:
 
 - Direct chat (DM): unknown users do not get normal bot replies; they receive pairing flow first.
 - Group chat: bot replies only when explicitly mentioned.
-- Group chat context: when mention is required, the bot fetches recent group messages and includes up to `historyLimit` entries before replying.
+- Group chat context: by default no recent-group preload is injected (`historyLimit: 0`); set `historyLimit > 0` to prepend recent messages automatically.
 - Mention detection: uses structured mention IDs from inbound payload (`mentionIds` / `mentions[].uid`) matched against bot user id.
 - If mention detection is unavailable while mention is required: message is denied by default.
 - Authorized control commands can bypass mention gating.

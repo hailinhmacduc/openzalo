@@ -241,19 +241,64 @@ function readActionMessageField(params: Record<string, unknown>, key: string): s
   return trimmed || undefined;
 }
 
-function resolveOpenzaloActionThread(params: Record<string, unknown>): { threadId: string; isGroup: boolean } {
-  const rawTarget =
-    readStringParam(params, "to") ??
-    readStringParam(params, "threadId") ??
-    readStringParam(params, "channelId", { required: true });
+function resolveOpenzaloActionThread(
+  params: Record<string, unknown>,
+  toolContext?: { currentChannelId?: string },
+): { threadId: string; isGroup: boolean } {
+  const toTarget = readStringParam(params, "to");
+  const threadTarget = readStringParam(params, "threadId");
+  const channelTarget = readStringParam(params, "channelId");
+  const contextTarget = toolContext?.currentChannelId?.trim();
+  const rawTarget = toTarget ?? threadTarget ?? channelTarget ?? contextTarget;
+  if (!rawTarget) {
+    throw new Error("thread target required");
+  }
+
   const parsed = parseOpenzaloActionTarget(rawTarget);
   if (!parsed.threadId) {
     throw new Error("thread target required");
   }
+
   const explicitGroup = typeof params.isGroup === "boolean" ? params.isGroup : undefined;
+  if (explicitGroup !== undefined) {
+    return {
+      threadId: parsed.threadId,
+      isGroup: explicitGroup,
+    };
+  }
+  if (parsed.isGroup) {
+    return {
+      threadId: parsed.threadId,
+      isGroup: true,
+    };
+  }
+
+  const groupHintTargets = [channelTarget, toTarget, contextTarget]
+    .filter((value): value is string => Boolean(value))
+    .map((value) => parseOpenzaloActionTarget(value))
+    .some((value) => value.isGroup && value.threadId === parsed.threadId);
+
+  if (groupHintTargets) {
+    return {
+      threadId: parsed.threadId,
+      isGroup: true,
+    };
+  }
+
+  const chatType = (
+    readStringParam(params, "chatType") ?? readStringParam(params, "chat_type")
+  )?.trim()
+    .toLowerCase();
+  if (chatType === "group") {
+    return {
+      threadId: parsed.threadId,
+      isGroup: true,
+    };
+  }
+
   return {
     threadId: parsed.threadId,
-    isGroup: explicitGroup ?? parsed.isGroup,
+    isGroup: false,
   };
 }
 
@@ -771,7 +816,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
       const accountId = typeof args.accountId === "string" ? args.accountId.trim() : undefined;
       return { to, accountId };
     },
-    handleAction: async ({ action, params, cfg, accountId }) => {
+    handleAction: async ({ action, params, cfg, accountId, toolContext }) => {
       const account = resolveOpenzaloAccountSync({ cfg, accountId });
       const actionGate = createActionGate(
         (account.config.actions ?? {}) as OpenzaloActionsConfig,
@@ -794,7 +839,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
           }) ?? undefined;
         const captionText = readStringParam(params, "caption", { allowEmpty: true });
         const content = messageText ?? captionText ?? "";
-        const target = resolveOpenzaloActionThread(params);
+        const target = resolveOpenzaloActionThread(params, toolContext);
         const result = await sendMessageOpenzalo(target.threadId, content, {
           profile: account.profile,
           isGroup: target.isGroup,
@@ -817,7 +862,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
         if (!actionGate("messages")) {
           throw new Error("Openzalo read action is disabled via actions.messages.");
         }
-        const target = resolveOpenzaloActionThread(params);
+        const target = resolveOpenzaloActionThread(params, toolContext);
         const count = readNumberParam(params, "limit", { integer: true });
         const result = await readRecentMessagesOpenzalo(target.threadId, {
           profile: account.profile,
@@ -839,7 +884,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
         if (!actionGate("reactions")) {
           throw new Error("Openzalo reactions are disabled via actions.reactions.");
         }
-        const target = resolveOpenzaloActionThread(params);
+        const target = resolveOpenzaloActionThread(params, toolContext);
         const msgId =
           readActionMessageField(params, "msgId") ??
           readActionMessageField(params, "messageId") ??
@@ -878,7 +923,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
         if (!actionGate("messages")) {
           throw new Error("Openzalo edit action is disabled via actions.messages.");
         }
-        const target = resolveOpenzaloActionThread(params);
+        const target = resolveOpenzaloActionThread(params, toolContext);
         const msgId =
           readActionMessageField(params, "msgId") ??
           readActionMessageField(params, "messageId") ??
@@ -919,7 +964,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
         if (!actionGate("messages")) {
           throw new Error(`Openzalo ${action} action is disabled via actions.messages.`);
         }
-        const target = resolveOpenzaloActionThread(params);
+        const target = resolveOpenzaloActionThread(params, toolContext);
         const pinned = action === "pin";
         const result = await pinConversationOpenzalo(target.threadId, {
           profile: account.profile,
@@ -983,7 +1028,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
         if (!actionGate("messages")) {
           throw new Error("Openzalo unsend action is disabled via actions.messages.");
         }
-        const target = resolveOpenzaloActionThread(params);
+        const target = resolveOpenzaloActionThread(params, toolContext);
         const msgId =
           readActionMessageField(params, "msgId") ??
           readActionMessageField(params, "messageId") ??
@@ -1014,7 +1059,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
         if (!actionGate("messages")) {
           throw new Error("Openzalo delete action is disabled via actions.messages.");
         }
-        const target = resolveOpenzaloActionThread(params);
+        const target = resolveOpenzaloActionThread(params, toolContext);
         const msgId =
           readActionMessageField(params, "msgId") ??
           readActionMessageField(params, "messageId") ??

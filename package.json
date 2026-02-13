@@ -1,0 +1,35 @@
+{
+  "name": "@openclaw/openzalo",
+  "version": "2026.2.12",
+  "description": "OpenClaw Zalo Personal Account plugin via openzca",
+  "type": "module",
+  "dependencies": {
+    "@sinclair/typebox": "0.34.48"
+  },
+  "devDependencies": {
+    "openclaw": "workspace:*"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "channel": {
+      "id": "openzalo",
+      "label": "Zalo Personal",
+      "selectionLabel": "Zalo (Personal Account)",
+      "docsPath": "/channels/openzalo",
+      "docsLabel": "openzalo",
+      "blurb": "Zalo personal account via QR code login.",
+      "aliases": [
+        "zlu"
+      ],
+      "order": 85,
+      "quickstartAllowFrom": true
+    },
+    "install": {
+      "npmSpec": "@openclaw/openzalo",
+      "localPath": "extensions/openzalo",
+      "defaultChoice": "npm"
+    }
+  }
+}

@@ -6,11 +6,36 @@ OpenClaw extension for Zalo Personal Account messaging via [openzca](https://ope
 
 ## Features
 
-- **Channel Plugin Integration**: Appears in onboarding wizard with QR login
-- **Gateway Integration**: Real-time message listening via the gateway
-- **Multi-Account Support**: Manage multiple Zalo personal accounts
-- **CLI Commands**: Full command-line interface for messaging
-- **Agent Tool**: AI agent integration for automated messaging
+- **Always-On Gateway Listener**: Uses `openzca listen -r -k` with auto-restart on listener failures.
+- **Reply Messaging**: End-to-end inbound -> agent -> outbound reply flow for direct and group chats.
+- **Typing Indicator**: Sends typing events while OpenClaw is processing/replying.
+- **Media Sending**: Supports image/video/voice style media send via `openzca msg <type> -u <url-or-path>`.
+- **Group Reply Modes**: Supports open groups and mention-required groups (`groupRequireMention`), with group allowlist policy support.
+- **Human Pass Mode**: `human pass on/off` to pause/resume bot replies per chat while still ingesting messages for context.
+- **Failure Notice Fallback**: Optional user-facing fallback message when reply dispatch fails.
+- **Interactive Message Actions**: Supports OpenClaw actions (`send`, `read`, `react`, `edit`, `unsend`, `delete`, `pin`, `unpin`, `list-pins`, `member-info`) using `openzca` commands.
+- **Live Directory Queries**: `listPeersLive`/`listGroupsLive` adapters return fresh contact/group data on each query.
+- **Config-Driven Outbound Limits**: Supports `textChunkLimit`, `chunkMode`, and `mediaMaxMb` with account-level overrides.
+- **Multi-Account Support**: Manage multiple Zalo personal accounts.
+- **Agent Tool**: AI agent integration for messaging and directory/status actions.
+
+## Feature Matrix
+
+| Capability | `zalouser` baseline | `openzalo` |
+|---|---|---|
+| Always-on listener | Yes | Yes |
+| Reply text message | Yes | Yes |
+| Typing indicator during thinking | Usually missing | Yes |
+| Error notice on reply failure | Often silent | Yes (`sendFailureNotice`) |
+| Send files/media (image/video/voice/link) | Yes | Yes |
+| Group reply all messages | Yes | Yes (configurable) |
+| Group mention-required mode | Inconsistent by setup | Yes (`groupRequireMention`) |
+| Human pass (pause bot replies) | No | Yes |
+| Keep ingesting context while paused/untagged | Partial | Yes |
+| Interactive actions (`send/read/react/edit/unsend/delete/pin/unpin/list-pins/member-info`) | Limited | Yes |
+| Live directory refresh (`listPeersLive` / `listGroupsLive`) | Limited | Yes |
+| Config-driven limits (`textChunkLimit`, `chunkMode`, `mediaMaxMb`) | Partial | Yes |
+| Backend compatibility with `openzca` | Yes | Yes |
 
 ## Prerequisites
 
@@ -76,6 +101,12 @@ channels:
     groupMentionDetectionFailure: deny # allow | deny | allow-with-warning
     sendFailureNotice: true # send fallback message on dispatch failure
     sendFailureMessage: Some problem occurred, could not send a reply.
+    textChunkLimit: 2000 # max supported by openzca/openzalo
+    chunkMode: length # length | newline
+    mediaMaxMb: 50 # outbound media limit
+    actions:
+      messages: true # read/delete/unsend
+      reactions: true # react
 ```
 
 For multi-account:
@@ -130,9 +161,21 @@ openzca account label <profile> "Work Account"
 # Text
 openclaw message send --channel openzalo --target <threadId> --message "message"
 
-# Media (URL)
+# Media (URL or file path supported by openzca -u)
 openclaw message send --channel openzalo --target <threadId> --message "caption" --media-url "https://example.com/img.jpg"
+
+# Video/voice are auto-detected by extension in openzalo send helpers
+# (e.g. .mp4 -> video, .mp3/.wav/.ogg/.m4a -> voice)
 ```
+
+### Human Pass Mode
+
+Human pass mode lets a human take over the conversation temporarily.
+
+- `human pass on`: bot stops replying in that chat/session.
+- `human pass off`: bot resumes replying in that chat/session.
+- While enabled, inbound messages are still ingested into session context.
+- In groups with mention-required mode, untagged messages are still recorded for context, but bot replies remain mention-gated.
 
 ### Listener
 

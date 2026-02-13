@@ -5,6 +5,12 @@ type OpenzaloAccountStatus = {
   enabled?: unknown;
   configured?: unknown;
   dmPolicy?: unknown;
+  groupPolicy?: unknown;
+  groupRequireMention?: unknown;
+  groupMentionDetectionFailure?: unknown;
+  sendFailureNotice?: unknown;
+  groupCount?: unknown;
+  hasWildcardGroupRule?: unknown;
   lastError?: unknown;
 };
 
@@ -14,16 +20,29 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 const asString = (value: unknown): string | undefined =>
   typeof value === "string" ? value : typeof value === "number" ? String(value) : undefined;
 
+const asBoolean = (value: unknown): boolean | undefined =>
+  typeof value === "boolean" ? value : undefined;
+
+const asNumber = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
 function readOpenzaloAccountStatus(value: ChannelAccountSnapshot): OpenzaloAccountStatus | null {
   if (!isRecord(value)) {
     return null;
   }
+  const raw = value as Record<string, unknown>;
   return {
-    accountId: value.accountId,
-    enabled: value.enabled,
-    configured: value.configured,
-    dmPolicy: value.dmPolicy,
-    lastError: value.lastError,
+    accountId: raw.accountId,
+    enabled: raw.enabled,
+    configured: raw.configured,
+    dmPolicy: raw.dmPolicy,
+    groupPolicy: raw.groupPolicy,
+    groupRequireMention: raw.groupRequireMention,
+    groupMentionDetectionFailure: raw.groupMentionDetectionFailure,
+    sendFailureNotice: raw.sendFailureNotice,
+    groupCount: raw.groupCount,
+    hasWildcardGroupRule: raw.hasWildcardGroupRule,
+    lastError: raw.lastError,
   };
 }
 
@@ -90,6 +109,67 @@ export function collectOpenzaloStatusIssues(
         message:
           'Zalo Personal dmPolicy is "open", allowing any user to message the bot without pairing.',
         fix: 'Set channels.openzalo.dmPolicy to "pairing" or "allowlist" to restrict access.',
+      });
+    }
+
+    const groupPolicy = asString(account.groupPolicy) ?? "open";
+    const groupRequireMention = asBoolean(account.groupRequireMention) ?? true;
+    const mentionDetectionFailureMode = asString(account.groupMentionDetectionFailure) ?? "deny";
+    const groupCount = asNumber(account.groupCount) ?? 0;
+    const hasWildcardGroupRule = asBoolean(account.hasWildcardGroupRule) === true;
+
+    if (groupPolicy === "open" && !groupRequireMention) {
+      issues.push({
+        channel: "openzalo",
+        accountId,
+        kind: "config",
+        message:
+          'Zalo Personal groupPolicy is "open" and groupRequireMention is disabled; group chats can trigger very broadly.',
+        fix: 'Set channels.openzalo.groupRequireMention to true, or set channels.openzalo.groupPolicy to "allowlist".',
+      });
+    }
+
+    if (groupPolicy === "open" && groupCount === 0 && !hasWildcardGroupRule) {
+      issues.push({
+        channel: "openzalo",
+        accountId,
+        kind: "config",
+        message:
+          'Zalo Personal groupPolicy is "open" with no group allowlist, so any group can trigger when mention policy allows it.',
+        fix: 'Set channels.openzalo.groupPolicy to "allowlist" and configure channels.openzalo.groups.',
+      });
+    }
+
+    if (groupPolicy === "allowlist" && groupCount === 0) {
+      issues.push({
+        channel: "openzalo",
+        accountId,
+        kind: "config",
+        message:
+          'Zalo Personal groupPolicy is "allowlist" but no groups are configured, so all group messages are blocked.',
+        fix: "Add entries under channels.openzalo.groups.",
+      });
+    }
+
+    if (groupRequireMention && mentionDetectionFailureMode === "deny") {
+      issues.push({
+        channel: "openzalo",
+        accountId,
+        kind: "config",
+        message:
+          'groupRequireMention is enabled and groupMentionDetectionFailure is "deny"; if mention detection is unavailable at runtime, group replies are blocked.',
+        fix: 'Set channels.openzalo.groupMentionDetectionFailure to "allow-with-warning" to keep group replies available during detection fallback.',
+      });
+    }
+
+    if (asBoolean(account.sendFailureNotice) === false) {
+      issues.push({
+        channel: "openzalo",
+        accountId,
+        kind: "config",
+        message:
+          "sendFailureNotice is disabled; reply/send failures may appear as silent bot drops to end users.",
+        fix: "Set channels.openzalo.sendFailureNotice to true.",
       });
     }
   }

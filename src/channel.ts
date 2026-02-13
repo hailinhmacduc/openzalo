@@ -4,17 +4,23 @@ import type {
   ChannelDock,
   ChannelGroupContext,
   ChannelPlugin,
+  ChannelMessageActionName,
   OpenClawConfig,
   GroupToolPolicyConfig,
 } from "openclaw/plugin-sdk";
 import {
   applyAccountNameToChannelSection,
   buildChannelConfigSchema,
+  createActionGate,
   DEFAULT_ACCOUNT_ID,
   deleteAccountFromConfigSection,
   formatPairingApproveHint,
+  jsonResult,
   migrateBaseNameToDefaultAccount,
   normalizeAccountId,
+  readNumberParam,
+  readStringParam,
+  resolveChannelMediaMaxBytes,
   setAccountEnabledInConfigSection,
 } from "openclaw/plugin-sdk";
 import type { ZcaFriend, ZcaGroup, ZcaUserInfo } from "./types.js";
@@ -29,9 +35,21 @@ import {
 import { OpenzaloConfigSchema } from "./config-schema.js";
 import { openzaloOnboardingAdapter } from "./onboarding.js";
 import { probeOpenzalo } from "./probe.js";
-import { sendMessageOpenzalo } from "./send.js";
+import {
+  deleteMessageOpenzalo,
+  editMessageOpenzalo,
+  getMemberInfoOpenzalo,
+  listPinnedConversationsOpenzalo,
+  pinConversationOpenzalo,
+  readRecentMessagesOpenzalo,
+  sendMessageOpenzalo,
+  sendReactionOpenzalo,
+  unsendMessageOpenzalo,
+} from "./send.js";
 import { collectOpenzaloStatusIssues } from "./status-issues.js";
 import { checkOpenzcaInstalled, parseJsonOutput, resolveOpenzcaProfileEnv, runOpenzca, runOpenzcaInteractive } from "./openzca.js";
+import { OPENZALO_TEXT_LIMIT } from "./constants.js";
+import { getOpenzaloRuntime } from "./runtime.js";
 
 const meta = {
   id: "openzalo",
@@ -91,9 +109,12 @@ function resolveOpenzaloGroupToolPolicy(
   const groups = account.config.groups ?? {};
   const groupId = params.groupId?.trim();
   const groupChannel = params.groupChannel?.trim();
-  const candidates = [groupId, groupChannel, "*"].filter((value): value is string =>
-    Boolean(value),
-  );
+  const candidates = [
+    groupId,
+    groupChannel,
+    groupId ? `group:${groupId}` : undefined,
+    "*",
+  ].filter((value): value is string => Boolean(value));
   for (const key of candidates) {
     const entry = groups[key];
     if (entry?.tools) {
@@ -119,9 +140,12 @@ function resolveOpenzaloGroupRequireMention({
     accountId: accountId ?? undefined,
   });
   const groups = account.config.groups ?? {};
-  const normalizedCandidates = [groupId?.trim(), groupChannel?.trim(), "*"].filter(
-    (value): value is string => Boolean(value),
-  );
+  const normalizedCandidates = [
+    groupId?.trim(),
+    groupChannel?.trim(),
+    groupId?.trim() ? `group:${groupId.trim()}` : undefined,
+    "*",
+  ].filter((value): value is string => Boolean(value));
   for (const key of normalizedCandidates) {
     const groupConfig = groups[key];
     if (groupConfig?.requireMention !== undefined) {
@@ -129,7 +153,145 @@ function resolveOpenzaloGroupRequireMention({
     }
   }
 
-  return account.config.groupRequireMention ?? false;
+  return account.config.groupRequireMention ?? true;
+}
+
+type OpenzaloActionsConfig = {
+  messages?: boolean;
+  reactions?: boolean;
+};
+
+function parseOpenzaloActionTarget(rawTarget: string): { threadId: string; isGroup: boolean } {
+  const cleaned = rawTarget.replace(/^(openzalo|zlu):/i, "").trim();
+  if (cleaned.toLowerCase().startsWith("group:")) {
+    const threadId = cleaned.slice("group:".length).trim();
+    return { threadId, isGroup: true };
+  }
+  if (cleaned.toLowerCase().startsWith("user:")) {
+    const threadId = cleaned.slice("user:".length).trim();
+    return { threadId, isGroup: false };
+  }
+  return { threadId: cleaned, isGroup: false };
+}
+
+function readActionMessageField(params: Record<string, unknown>, key: string): string | undefined {
+  const direct = readStringParam(params, key);
+  if (direct) {
+    return direct;
+  }
+  const fromMessage = params.message;
+  if (!fromMessage || typeof fromMessage !== "object") {
+    return undefined;
+  }
+  const value = (fromMessage as Record<string, unknown>)[key];
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed || undefined;
+}
+
+function resolveOpenzaloActionThread(params: Record<string, unknown>): { threadId: string; isGroup: boolean } {
+  const rawTarget =
+    readStringParam(params, "to") ??
+    readStringParam(params, "threadId") ??
+    readStringParam(params, "channelId", { required: true });
+  const parsed = parseOpenzaloActionTarget(rawTarget);
+  if (!parsed.threadId) {
+    throw new Error("thread target required");
+  }
+  const explicitGroup = typeof params.isGroup === "boolean" ? params.isGroup : undefined;
+  return {
+    threadId: parsed.threadId,
+    isGroup: explicitGroup ?? parsed.isGroup,
+  };
+}
+
+function resolveOpenzaloMediaMaxBytes(cfg: OpenClawConfig, accountId?: string | null): number | undefined {
+  return resolveChannelMediaMaxBytes({
+    cfg,
+    resolveChannelLimitMb: ({ cfg, accountId }) =>
+      cfg.channels?.openzalo?.accounts?.[accountId]?.mediaMaxMb ?? cfg.channels?.openzalo?.mediaMaxMb,
+    accountId,
+  });
+}
+
+function readSnapshotMetric(
+  snapshot: ChannelAccountSnapshot | undefined,
+  key: string,
+): number {
+  const raw = snapshot as Record<string, unknown> | undefined;
+  const value = raw?.[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+async function listOpenzaloPeersDirectory(params: {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+  query?: string | null;
+  limit?: number | null;
+}): Promise<ChannelDirectoryEntry[]> {
+  const ok = await checkOpenzcaInstalled();
+  if (!ok) {
+    throw new Error("Missing dependency: `openzca` not found in PATH");
+  }
+  const account = resolveOpenzaloAccountSync({ cfg: params.cfg, accountId: params.accountId });
+  const args = params.query?.trim()
+    ? ["friend", "find", params.query.trim()]
+    : ["friend", "list", "-j"];
+  const result = await runOpenzca(args, { profile: account.profile, timeout: 15000 });
+  if (!result.ok) {
+    throw new Error(result.stderr || "Failed to list peers");
+  }
+  const parsed = parseJsonOutput<ZcaFriend[]>(result.stdout);
+  const rows = Array.isArray(parsed)
+    ? parsed.map((f) =>
+        mapUser({
+          id: String(f.userId),
+          name: f.displayName ?? null,
+          avatarUrl: f.avatar ?? null,
+          raw: f,
+        }),
+      )
+    : [];
+  const limit = params.limit;
+  return typeof limit === "number" && limit > 0 ? rows.slice(0, limit) : rows;
+}
+
+async function listOpenzaloGroupsDirectory(params: {
+  cfg: OpenClawConfig;
+  accountId?: string | null;
+  query?: string | null;
+  limit?: number | null;
+}): Promise<ChannelDirectoryEntry[]> {
+  const ok = await checkOpenzcaInstalled();
+  if (!ok) {
+    throw new Error("Missing dependency: `openzca` not found in PATH");
+  }
+  const account = resolveOpenzaloAccountSync({ cfg: params.cfg, accountId: params.accountId });
+  const result = await runOpenzca(["group", "list", "-j"], {
+    profile: account.profile,
+    timeout: 15000,
+  });
+  if (!result.ok) {
+    throw new Error(result.stderr || "Failed to list groups");
+  }
+  const parsed = parseJsonOutput<ZcaGroup[]>(result.stdout);
+  let rows = Array.isArray(parsed)
+    ? parsed.map((g) =>
+        mapGroup({
+          id: String(g.groupId),
+          name: g.name ?? null,
+          raw: g,
+        }),
+      )
+    : [];
+  const q = params.query?.trim().toLowerCase();
+  if (q) {
+    rows = rows.filter((g) => (g.name ?? "").toLowerCase().includes(q) || g.id.includes(q));
+  }
+  const limit = params.limit;
+  return typeof limit === "number" && limit > 0 ? rows.slice(0, limit) : rows;
 }
 
 export const openzaloDock: ChannelDock = {
@@ -137,9 +299,15 @@ export const openzaloDock: ChannelDock = {
   capabilities: {
     chatTypes: ["direct", "group"],
     media: true,
+    reactions: true,
+    edit: true,
+    unsend: true,
     blockStreaming: true,
   },
-  outbound: { textChunkLimit: 2000 },
+  streaming: {
+    blockStreamingCoalesceDefaults: { minChars: 1500, idleMs: 1000 },
+  },
+  outbound: { textChunkLimit: OPENZALO_TEXT_LIMIT },
   config: {
     resolveAllowFrom: ({ cfg, accountId }) =>
       (resolveOpenzaloAccountSync({ cfg: cfg, accountId }).config.allowFrom ?? []).map((entry) =>
@@ -169,10 +337,15 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
     chatTypes: ["direct", "group"],
     media: true,
     reactions: true,
+    edit: true,
+    unsend: true,
     threads: false,
     polls: false,
     nativeCommands: false,
     blockStreaming: true,
+  },
+  streaming: {
+    blockStreamingCoalesceDefaults: { minChars: 1500, idleMs: 1000 },
   },
   reload: { configPrefixes: ["channels.openzalo"] },
   configSchema: buildChannelConfigSchema(OpenzaloConfigSchema),
@@ -243,6 +416,34 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
         approveHint: formatPairingApproveHint("openzalo"),
         normalizeEntry: (raw) => raw.replace(/^(openzalo|zlu):/i, ""),
       };
+    },
+    collectWarnings: ({ account, cfg }) => {
+      const warnings: string[] = [];
+      const defaultGroupPolicy = cfg.channels?.defaults?.groupPolicy;
+      const groupPolicy = account.config.groupPolicy ?? defaultGroupPolicy ?? "open";
+      const groups = account.config.groups ?? {};
+      const groupCount = Object.keys(groups).length;
+      const requireMention = account.config.groupRequireMention ?? true;
+
+      if (groupPolicy === "open") {
+        if (!requireMention) {
+          warnings.push(
+            `- Openzalo groups: groupPolicy="open" and groupRequireMention=false allows broad group triggering. Set channels.openzalo.groupRequireMention=true or use channels.openzalo.groupPolicy="allowlist".`,
+          );
+        } else if (groupCount === 0) {
+          warnings.push(
+            `- Openzalo groups: groupPolicy="open" with no channels.openzalo.groups allowlist. Any group can trigger when mentioned. Set channels.openzalo.groupPolicy="allowlist" and configure channels.openzalo.groups.`,
+          );
+        }
+      }
+
+      if (groupPolicy === "allowlist" && groupCount === 0) {
+        warnings.push(
+          `- Openzalo groups: groupPolicy="allowlist" but channels.openzalo.groups is empty, so all group messages are blocked until groups are configured.`,
+        );
+      }
+
+      return warnings;
     },
   },
   groups: {
@@ -352,59 +553,14 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
         raw: parsed,
       });
     },
-    listPeers: async ({ cfg, accountId, query, limit }) => {
-      const ok = await checkOpenzcaInstalled();
-      if (!ok) {
-        throw new Error("Missing dependency: `openzca` not found in PATH");
-      }
-      const account = resolveOpenzaloAccountSync({ cfg: cfg, accountId });
-      const args = query?.trim() ? ["friend", "find", query.trim()] : ["friend", "list", "-j"];
-      const result = await runOpenzca(args, { profile: account.profile, timeout: 15000 });
-      if (!result.ok) {
-        throw new Error(result.stderr || "Failed to list peers");
-      }
-      const parsed = parseJsonOutput<ZcaFriend[]>(result.stdout);
-      const rows = Array.isArray(parsed)
-        ? parsed.map((f) =>
-            mapUser({
-              id: String(f.userId),
-              name: f.displayName ?? null,
-              avatarUrl: f.avatar ?? null,
-              raw: f,
-            }),
-          )
-        : [];
-      return typeof limit === "number" && limit > 0 ? rows.slice(0, limit) : rows;
-    },
-    listGroups: async ({ cfg, accountId, query, limit }) => {
-      const ok = await checkOpenzcaInstalled();
-      if (!ok) {
-        throw new Error("Missing dependency: `openzca` not found in PATH");
-      }
-      const account = resolveOpenzaloAccountSync({ cfg: cfg, accountId });
-      const result = await runOpenzca(["group", "list", "-j"], {
-        profile: account.profile,
-        timeout: 15000,
-      });
-      if (!result.ok) {
-        throw new Error(result.stderr || "Failed to list groups");
-      }
-      const parsed = parseJsonOutput<ZcaGroup[]>(result.stdout);
-      let rows = Array.isArray(parsed)
-        ? parsed.map((g) =>
-            mapGroup({
-              id: String(g.groupId),
-              name: g.name ?? null,
-              raw: g,
-            }),
-          )
-        : [];
-      const q = query?.trim().toLowerCase();
-      if (q) {
-        rows = rows.filter((g) => (g.name ?? "").toLowerCase().includes(q) || g.id.includes(q));
-      }
-      return typeof limit === "number" && limit > 0 ? rows.slice(0, limit) : rows;
-    },
+    listPeers: async ({ cfg, accountId, query, limit }) =>
+      listOpenzaloPeersDirectory({ cfg, accountId, query, limit }),
+    listGroups: async ({ cfg, accountId, query, limit }) =>
+      listOpenzaloGroupsDirectory({ cfg, accountId, query, limit }),
+    listPeersLive: async ({ cfg, accountId, query, limit }) =>
+      listOpenzaloPeersDirectory({ cfg, accountId, query, limit }),
+    listGroupsLive: async ({ cfg, accountId, query, limit }) =>
+      listOpenzaloGroupsDirectory({ cfg, accountId, query, limit }),
     listGroupMembers: async ({ cfg, accountId, groupId, limit }) => {
       const ok = await checkOpenzcaInstalled();
       if (!ok) {
@@ -511,6 +667,344 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
       return results;
     },
   },
+  actions: {
+    listActions: ({ cfg }) => {
+      const accountIds = listOpenzaloAccountIds(cfg);
+      const accounts = accountIds
+        .map((id) => resolveOpenzaloAccountSync({ cfg, accountId: id }))
+        .filter((account) => account.enabled);
+      if (accounts.length === 0) {
+        return [];
+      }
+
+      const actions = new Set<ChannelMessageActionName>(["send"]);
+      const isAnyEnabled = (key: keyof OpenzaloActionsConfig, defaultValue = true) =>
+        accounts.some((account) =>
+          createActionGate((account.config.actions ?? {}) as OpenzaloActionsConfig)(
+            key,
+            defaultValue,
+          ),
+        );
+
+      if (isAnyEnabled("messages")) {
+        actions.add("read");
+        actions.add("edit");
+        actions.add("delete");
+        actions.add("unsend");
+        actions.add("pin");
+        actions.add("unpin");
+        actions.add("list-pins");
+        actions.add("member-info");
+      }
+      if (isAnyEnabled("reactions")) {
+        actions.add("react");
+      }
+      return Array.from(actions);
+    },
+    extractToolSend: ({ args }) => {
+      const action = typeof args.action === "string" ? args.action.trim() : "";
+      if (action !== "sendMessage") {
+        return null;
+      }
+      const to =
+        (typeof args.to === "string" ? args.to.trim() : "") ||
+        (typeof args.threadId === "string" ? args.threadId.trim() : "");
+      if (!to) {
+        return null;
+      }
+      const accountId = typeof args.accountId === "string" ? args.accountId.trim() : undefined;
+      return { to, accountId };
+    },
+    handleAction: async ({ action, params, cfg, accountId }) => {
+      const account = resolveOpenzaloAccountSync({ cfg, accountId });
+      const actionGate = createActionGate(
+        (account.config.actions ?? {}) as OpenzaloActionsConfig,
+      );
+      const maxChars =
+        typeof account.config.textChunkLimit === "number" && account.config.textChunkLimit > 0
+          ? Math.min(Math.floor(account.config.textChunkLimit), OPENZALO_TEXT_LIMIT)
+          : OPENZALO_TEXT_LIMIT;
+      const maxBytes = resolveOpenzaloMediaMaxBytes(cfg, accountId);
+
+      if (action === "send") {
+        const mediaUrl =
+          readStringParam(params, "media", { trim: false }) ??
+          readStringParam(params, "path", { trim: false }) ??
+          readStringParam(params, "filePath", { trim: false });
+        const messageText =
+          readStringParam(params, "message", {
+            required: !mediaUrl,
+            allowEmpty: true,
+          }) ?? undefined;
+        const captionText = readStringParam(params, "caption", { allowEmpty: true });
+        const content = messageText ?? captionText ?? "";
+        const target = resolveOpenzaloActionThread(params);
+        const result = await sendMessageOpenzalo(target.threadId, content, {
+          profile: account.profile,
+          isGroup: target.isGroup,
+          mediaUrl: mediaUrl ?? undefined,
+          maxChars,
+          maxBytes,
+        });
+        if (!result.ok) {
+          throw new Error(result.error || "Failed to send message");
+        }
+        return jsonResult({
+          ok: true,
+          action: "send",
+          threadId: target.threadId,
+          messageId: result.messageId ?? null,
+        });
+      }
+
+      if (action === "read") {
+        if (!actionGate("messages")) {
+          throw new Error("Openzalo read action is disabled via actions.messages.");
+        }
+        const target = resolveOpenzaloActionThread(params);
+        const count = readNumberParam(params, "limit", { integer: true });
+        const result = await readRecentMessagesOpenzalo(target.threadId, {
+          profile: account.profile,
+          isGroup: target.isGroup,
+          count: count ?? undefined,
+        });
+        if (!result.ok) {
+          throw new Error(result.error || "Failed to read recent messages");
+        }
+        return jsonResult({
+          ok: true,
+          action: "read",
+          threadId: target.threadId,
+          data: result.output ?? null,
+        });
+      }
+
+      if (action === "react") {
+        if (!actionGate("reactions")) {
+          throw new Error("Openzalo reactions are disabled via actions.reactions.");
+        }
+        const target = resolveOpenzaloActionThread(params);
+        const msgId =
+          readActionMessageField(params, "msgId") ??
+          readActionMessageField(params, "messageId") ??
+          readStringParam(params, "msgId", { required: true, label: "msgId/messageId" });
+        const cliMsgId =
+          readActionMessageField(params, "cliMsgId") ??
+          readActionMessageField(params, "clientMessageId") ??
+          readStringParam(params, "cliMsgId", { required: true });
+        const reaction =
+          readStringParam(params, "emoji") ??
+          readStringParam(params, "reaction", { required: true });
+        const result = await sendReactionOpenzalo(
+          {
+            threadId: target.threadId,
+            msgId,
+            cliMsgId,
+            reaction,
+          },
+          {
+            profile: account.profile,
+            isGroup: target.isGroup,
+          },
+        );
+        if (!result.ok) {
+          throw new Error(result.error || "Failed to react to message");
+        }
+        return jsonResult({
+          ok: true,
+          action: "react",
+          threadId: target.threadId,
+          data: result.output ?? null,
+        });
+      }
+
+      if (action === "edit") {
+        if (!actionGate("messages")) {
+          throw new Error("Openzalo edit action is disabled via actions.messages.");
+        }
+        const target = resolveOpenzaloActionThread(params);
+        const msgId =
+          readActionMessageField(params, "msgId") ??
+          readActionMessageField(params, "messageId") ??
+          readStringParam(params, "msgId", { required: true, label: "msgId/messageId" });
+        const cliMsgId =
+          readActionMessageField(params, "cliMsgId") ??
+          readActionMessageField(params, "clientMessageId") ??
+          readStringParam(params, "cliMsgId", { required: true });
+        const message = readStringParam(params, "message", {
+          required: true,
+          allowEmpty: true,
+        });
+        const result = await editMessageOpenzalo(
+          {
+            threadId: target.threadId,
+            msgId,
+            cliMsgId,
+            message,
+          },
+          {
+            profile: account.profile,
+            isGroup: target.isGroup,
+            maxChars,
+          },
+        );
+        if (!result.ok) {
+          throw new Error(result.error || "Failed to edit message");
+        }
+        return jsonResult({
+          ok: true,
+          action: "edit",
+          threadId: target.threadId,
+          data: result.output ?? null,
+        });
+      }
+
+      if (action === "pin" || action === "unpin") {
+        if (!actionGate("messages")) {
+          throw new Error(`Openzalo ${action} action is disabled via actions.messages.`);
+        }
+        const target = resolveOpenzaloActionThread(params);
+        const pinned = action === "pin";
+        const result = await pinConversationOpenzalo(target.threadId, {
+          profile: account.profile,
+          isGroup: target.isGroup,
+          pinned,
+        });
+        if (!result.ok) {
+          throw new Error(
+            result.error || `Failed to ${pinned ? "pin" : "unpin"} conversation`,
+          );
+        }
+        return jsonResult({
+          ok: true,
+          action,
+          threadId: target.threadId,
+          pinned,
+          data: result.output ?? null,
+        });
+      }
+
+      if (action === "list-pins") {
+        if (!actionGate("messages")) {
+          throw new Error("Openzalo list-pins action is disabled via actions.messages.");
+        }
+        const result = await listPinnedConversationsOpenzalo({
+          profile: account.profile,
+        });
+        if (!result.ok) {
+          throw new Error(result.error || "Failed to list pinned conversations");
+        }
+        return jsonResult({
+          ok: true,
+          action: "list-pins",
+          data: result.output ?? null,
+        });
+      }
+
+      if (action === "member-info") {
+        if (!actionGate("messages")) {
+          throw new Error("Openzalo member-info action is disabled via actions.messages.");
+        }
+        const userId =
+          readStringParam(params, "userId") ??
+          readStringParam(params, "memberId") ??
+          readStringParam(params, "id", { required: true, label: "userId/memberId" });
+        const result = await getMemberInfoOpenzalo(userId, {
+          profile: account.profile,
+        });
+        if (!result.ok) {
+          throw new Error(result.error || "Failed to get member info");
+        }
+        return jsonResult({
+          ok: true,
+          action: "member-info",
+          userId,
+          data: result.output ?? null,
+        });
+      }
+
+      if (action === "unsend") {
+        if (!actionGate("messages")) {
+          throw new Error("Openzalo unsend action is disabled via actions.messages.");
+        }
+        const target = resolveOpenzaloActionThread(params);
+        const msgId =
+          readActionMessageField(params, "msgId") ??
+          readActionMessageField(params, "messageId") ??
+          readStringParam(params, "msgId", { required: true, label: "msgId/messageId" });
+        const cliMsgId =
+          readActionMessageField(params, "cliMsgId") ??
+          readActionMessageField(params, "clientMessageId") ??
+          readStringParam(params, "cliMsgId", { required: true });
+        const result = await unsendMessageOpenzalo(
+          { threadId: target.threadId, msgId, cliMsgId },
+          {
+            profile: account.profile,
+            isGroup: target.isGroup,
+          },
+        );
+        if (!result.ok) {
+          throw new Error(result.error || "Failed to unsend message");
+        }
+        return jsonResult({
+          ok: true,
+          action: "unsend",
+          threadId: target.threadId,
+          data: result.output ?? null,
+        });
+      }
+
+      if (action === "delete") {
+        if (!actionGate("messages")) {
+          throw new Error("Openzalo delete action is disabled via actions.messages.");
+        }
+        const target = resolveOpenzaloActionThread(params);
+        const msgId =
+          readActionMessageField(params, "msgId") ??
+          readActionMessageField(params, "messageId") ??
+          readStringParam(params, "msgId", { required: true, label: "msgId/messageId" });
+        const cliMsgId =
+          readActionMessageField(params, "cliMsgId") ??
+          readActionMessageField(params, "clientMessageId") ??
+          readStringParam(params, "cliMsgId", { required: true });
+        const uidFrom =
+          readActionMessageField(params, "uidFrom") ??
+          readActionMessageField(params, "senderId") ??
+          readActionMessageField(params, "fromId") ??
+          readStringParam(params, "uidFrom", { required: true, label: "uidFrom/senderId" });
+        const onlyMe =
+          typeof params.onlyMe === "boolean"
+            ? params.onlyMe
+            : typeof params.only_me === "boolean"
+              ? params.only_me
+              : false;
+        const result = await deleteMessageOpenzalo(
+          {
+            threadId: target.threadId,
+            msgId,
+            cliMsgId,
+            uidFrom,
+            onlyMe,
+          },
+          {
+            profile: account.profile,
+            isGroup: target.isGroup,
+          },
+        );
+        if (!result.ok) {
+          throw new Error(result.error || "Failed to delete message");
+        }
+        return jsonResult({
+          ok: true,
+          action: "delete",
+          threadId: target.threadId,
+          data: result.output ?? null,
+        });
+      }
+
+      throw new Error(`Action ${action} is not supported for provider openzalo.`);
+    },
+  },
   pairing: {
     idLabel: "openzaloUserId",
     normalizeAllowEntry: (entry) => entry.replace(/^(openzalo|zlu):/i, ""),
@@ -548,42 +1042,21 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
   },
   outbound: {
     deliveryMode: "direct",
-    chunker: (text, limit) => {
-      if (!text) {
-        return [];
-      }
-      if (limit <= 0 || text.length <= limit) {
-        return [text];
-      }
-      const chunks: string[] = [];
-      let remaining = text;
-      while (remaining.length > limit) {
-        const window = remaining.slice(0, limit);
-        const lastNewline = window.lastIndexOf("\n");
-        const lastSpace = window.lastIndexOf(" ");
-        let breakIdx = lastNewline > 0 ? lastNewline : lastSpace;
-        if (breakIdx <= 0) {
-          breakIdx = limit;
-        }
-        const rawChunk = remaining.slice(0, breakIdx);
-        const chunk = rawChunk.trimEnd();
-        if (chunk.length > 0) {
-          chunks.push(chunk);
-        }
-        const brokeOnSeparator = breakIdx < remaining.length && /\s/.test(remaining[breakIdx]);
-        const nextStart = Math.min(remaining.length, breakIdx + (brokeOnSeparator ? 1 : 0));
-        remaining = remaining.slice(nextStart).trimStart();
-      }
-      if (remaining.length) {
-        chunks.push(remaining);
-      }
-      return chunks;
-    },
-    chunkerMode: "text",
-    textChunkLimit: 2000,
+    chunker: (text, limit) => getOpenzaloRuntime().channel.text.chunkMarkdownText(text, limit),
+    chunkerMode: "markdown",
+    textChunkLimit: OPENZALO_TEXT_LIMIT,
     sendText: async ({ to, text, accountId, cfg }) => {
       const account = resolveOpenzaloAccountSync({ cfg: cfg, accountId });
-      const result = await sendMessageOpenzalo(to, text, { profile: account.profile });
+      const maxChars =
+        typeof account.config.textChunkLimit === "number" && account.config.textChunkLimit > 0
+          ? Math.min(Math.floor(account.config.textChunkLimit), OPENZALO_TEXT_LIMIT)
+          : OPENZALO_TEXT_LIMIT;
+      const maxBytes = resolveOpenzaloMediaMaxBytes(cfg, accountId);
+      const result = await sendMessageOpenzalo(to, text, {
+        profile: account.profile,
+        maxChars,
+        maxBytes,
+      });
       return {
         channel: "openzalo",
         ok: result.ok,
@@ -593,9 +1066,16 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
     },
     sendMedia: async ({ to, text, mediaUrl, accountId, cfg }) => {
       const account = resolveOpenzaloAccountSync({ cfg: cfg, accountId });
+      const maxChars =
+        typeof account.config.textChunkLimit === "number" && account.config.textChunkLimit > 0
+          ? Math.min(Math.floor(account.config.textChunkLimit), OPENZALO_TEXT_LIMIT)
+          : OPENZALO_TEXT_LIMIT;
+      const maxBytes = resolveOpenzaloMediaMaxBytes(cfg, accountId);
       const result = await sendMessageOpenzalo(to, text, {
         profile: account.profile,
         mediaUrl,
+        maxChars,
+        maxBytes,
       });
       return {
         channel: "openzalo",
@@ -612,7 +1092,14 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
       lastStartAt: null,
       lastStopAt: null,
       lastError: null,
-    },
+      dispatchFailures: 0,
+      typingFailures: 0,
+      textChunkFailures: 0,
+      mediaFailures: 0,
+      failureNoticesSent: 0,
+      failureNoticeFailures: 0,
+      humanPassSkips: 0,
+    } as ChannelAccountSnapshot,
     collectStatusIssues: collectOpenzaloStatusIssues,
     buildChannelSummary: ({ snapshot }) => ({
       configured: snapshot.configured ?? false,
@@ -640,7 +1127,20 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
         lastInboundAt: runtime?.lastInboundAt ?? null,
         lastOutboundAt: runtime?.lastOutboundAt ?? null,
         dmPolicy: account.config.dmPolicy ?? "pairing",
-      };
+        groupPolicy: account.config.groupPolicy ?? "open",
+        groupRequireMention: account.config.groupRequireMention ?? true,
+        groupMentionDetectionFailure: account.config.groupMentionDetectionFailure,
+        sendFailureNotice: account.config.sendFailureNotice !== false,
+        groupCount: Object.keys(account.config.groups ?? {}).length,
+        hasWildcardGroupRule: Boolean(account.config.groups?.["*"]),
+        dispatchFailures: readSnapshotMetric(runtime, "dispatchFailures"),
+        typingFailures: readSnapshotMetric(runtime, "typingFailures"),
+        textChunkFailures: readSnapshotMetric(runtime, "textChunkFailures"),
+        mediaFailures: readSnapshotMetric(runtime, "mediaFailures"),
+        failureNoticesSent: readSnapshotMetric(runtime, "failureNoticesSent"),
+        failureNoticeFailures: readSnapshotMetric(runtime, "failureNoticeFailures"),
+        humanPassSkips: readSnapshotMetric(runtime, "humanPassSkips"),
+      } as ChannelAccountSnapshot;
     },
   },
   gateway: {

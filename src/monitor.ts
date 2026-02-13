@@ -5,6 +5,7 @@ import {
   createTypingCallbacks,
   logTypingFailure,
   mergeAllowlist,
+  resolveChannelMediaMaxBytes,
   summarizeMapping,
 } from "openclaw/plugin-sdk";
 import type {
@@ -17,25 +18,51 @@ import type {
 import { getOpenzaloRuntime } from "./runtime.js";
 import { sendMessageOpenzalo, sendTypingOpenzalo } from "./send.js";
 import { parseJsonOutput, runOpenzca, runOpenzcaStreaming } from "./openzca.js";
+import { OPENZALO_DEFAULT_FAILURE_NOTICE_MESSAGE, OPENZALO_TEXT_LIMIT } from "./constants.js";
+
+type OpenzaloStatusPatch = {
+  lastInboundAt?: number;
+  lastOutboundAt?: number;
+  dispatchFailures?: number;
+  typingFailures?: number;
+  textChunkFailures?: number;
+  mediaFailures?: number;
+  failureNoticesSent?: number;
+  failureNoticeFailures?: number;
+  humanPassSkips?: number;
+};
+
+type OpenzaloMetricName =
+  | "dispatchFailures"
+  | "typingFailures"
+  | "textChunkFailures"
+  | "mediaFailures"
+  | "failureNoticesSent"
+  | "failureNoticeFailures"
+  | "humanPassSkips";
+
+type OpenzaloMetricCounters = Record<OpenzaloMetricName, number>;
 
 export type OpenzaloMonitorOptions = {
   account: ResolvedOpenzaloAccount;
   config: OpenClawConfig;
   runtime: RuntimeEnv;
   abortSignal: AbortSignal;
-  statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
+  statusSink?: (patch: OpenzaloStatusPatch) => void;
 };
 
 export type OpenzaloMonitorResult = {
   stop: () => void;
 };
 
-const ZALOUSER_TEXT_LIMIT = 2000;
-
 type OpenzaloDispatchOutcome = {
   sent: boolean;
   failed: boolean;
+  textChunkFailures: number;
+  mediaFailures: number;
 };
+
+type HumanPassCommand = "on" | "off";
 
 function normalizeOpenzaloEntry(entry: string): string {
   return entry.replace(/^(openzalo|zlu):/i, "").trim();
@@ -61,12 +88,6 @@ function logVerbose(core: OpenzaloCoreRuntime, runtime: RuntimeEnv, message: str
   if (core.logging.shouldLogVerbose()) {
     runtime.log(`[openzalo] ${message}`);
   }
-}
-
-function getMentionDetectionFailureMode(
-  account: ResolvedOpenzaloAccount,
-): OpenzaloGroupMentionDetectionFailureMode {
-  return account.config.groupMentionDetectionFailure ?? "deny";
 }
 
 function warnMentionDetectionFailure({
@@ -139,6 +160,86 @@ function isGroupAllowed(params: {
   return false;
 }
 
+function classifyOpenzcaStderr(text: string): "info" | "warn" | "error" {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return "info";
+  }
+
+  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(trimmed) as { level?: unknown; severity?: unknown };
+      const level = String(parsed.level ?? parsed.severity ?? "").toLowerCase();
+      if (level.includes("error") || level.includes("fatal")) {
+        return "error";
+      }
+      if (level.includes("warn")) {
+        return "warn";
+      }
+      if (level) {
+        return "info";
+      }
+    } catch {
+      // Ignore JSON parsing errors; fall back to pattern heuristics below.
+    }
+  }
+
+  const lower = trimmed.toLowerCase();
+  const infoHints = [
+    "debug",
+    "info",
+    "listening",
+    "connected",
+    "reconnected",
+    "heartbeat",
+    "ping",
+    "pong",
+    "keepalive",
+    "qr",
+    "scan",
+  ];
+  if (infoHints.some((hint) => lower.includes(hint))) {
+    return "info";
+  }
+
+  const errorHints = [
+    "error",
+    "exception",
+    "unhandled",
+    "fatal",
+    "panic",
+    "denied",
+    "failed",
+    "timeout",
+    "refused",
+    "reject",
+    "enoent",
+    "econnreset",
+    "eacces",
+  ];
+  if (errorHints.some((hint) => lower.includes(hint))) {
+    return "error";
+  }
+
+  const warnHints = ["warn", "warning", "retry", "reconnect", "backoff", "throttle"];
+  if (warnHints.some((hint) => lower.includes(hint))) {
+    return "warn";
+  }
+
+  return "info";
+}
+
+function parseHumanPassCommand(raw: string): HumanPassCommand | null {
+  const normalized = raw.trim().toLowerCase();
+  if (/^(?:\/)?(?:human\s*pass|humanpass|bot)\s+on$/.test(normalized)) {
+    return "on";
+  }
+  if (/^(?:\/)?(?:human\s*pass|humanpass|bot)\s+off$/.test(normalized)) {
+    return "off";
+  }
+  return null;
+}
+
 async function startOpenzcaListener(
   runtime: RuntimeEnv,
   profile: string,
@@ -170,11 +271,20 @@ async function startOpenzcaListener(
     onError,
   });
 
-    proc.stderr?.on("data", (data: Buffer) => {
+  proc.stderr?.on("data", (data: Buffer) => {
     const text = data.toString().trim();
-    if (text) {
-      runtime.error(`[openzalo] openzca stderr: ${text}`);
+    if (!text) {
+      return;
     }
+
+    const level = classifyOpenzcaStderr(text);
+    if (level === "error") {
+      runtime.error(`[openzalo] openzca stderr: ${text}`);
+      return;
+    }
+    runtime.log?.(
+      level === "warn" ? `[openzalo][warn] openzca stderr: ${text}` : `[openzalo] openzca stderr: ${text}`,
+    );
   });
 
   void promise.then((result) => {
@@ -200,8 +310,10 @@ async function processMessage(
   config: OpenClawConfig,
   core: OpenzaloCoreRuntime,
   runtime: RuntimeEnv,
-  statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void,
+  statusSink?: (patch: OpenzaloStatusPatch) => void,
   mentionDetectionFailureWarnings?: Set<string>,
+  humanPassSessions?: Set<string>,
+  recordMetric?: (name: OpenzaloMetricName, delta?: number) => void,
 ): Promise<void> {
   const { threadId, content, timestamp, metadata } = message;
   if (!content?.trim()) {
@@ -301,15 +413,12 @@ async function processMessage(
     }
   }
 
-  const isControlCommand = core.channel.commands.isControlCommandMessage(rawBody, config);
-  if (isGroup && isControlCommand && commandAuthorized !== true) {
-    logVerbose(
-      core,
-      runtime,
-      `openzalo: drop control command from unauthorized sender ${senderId}`,
-    );
-    return;
-  }
+  const humanPassCommand = parseHumanPassCommand(rawBody);
+  const isBuiltinControlCommand = core.channel.commands.isControlCommandMessage(rawBody, config);
+  const isControlCommand = isBuiltinControlCommand || humanPassCommand !== null;
+  const canManageHumanPass = commandAuthorized === true || senderAllowedForCommands;
+  const canRunControlCommand =
+    commandAuthorized === true || (humanPassCommand !== null && canManageHumanPass);
 
   const peer = isGroup
     ? { kind: "group" as const, id: chatId }
@@ -327,57 +436,24 @@ async function processMessage(
   });
 
   const mentionRegexes = core.channel.mentions.buildMentionRegexes(config, route.agentId);
+  if (mentionRegexes.length === 0 && route.agentId) {
+    const escapedAgentId = route.agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    mentionRegexes.push(new RegExp(`\\b@?${escapedAgentId}\\b`, "i"));
+  }
   const shouldRequireMention = isGroup
       ? core.channel.groups.resolveRequireMention({
           cfg: config,
           channel: "openzalo",
           accountId: account.accountId,
           groupId: chatId,
-          groupChannel: groupName,
         })
       : false;
   const wasMentioned = isGroup
     ? core.channel.mentions.matchesMentionPatterns(rawBody, mentionRegexes)
     : false;
-  const shouldBypassMention = isControlCommand && shouldRequireMention && commandAuthorized === true;
+  const shouldBypassMention = isControlCommand && shouldRequireMention && canRunControlCommand;
   const canDetectMention = mentionRegexes.length > 0;
   const effectiveWasMentioned = shouldBypassMention || wasMentioned;
-  if (isGroup && shouldRequireMention) {
-    if (canDetectMention) {
-      if (!effectiveWasMentioned) {
-        logVerbose(core, runtime, `openzalo: skip group message (mention required): ${chatId}`);
-        return;
-      }
-    } else {
-      const mode = getMentionDetectionFailureMode(account);
-      const warningKey = `${account.accountId}:${chatId}:mention-detection:${mode}`;
-      if (!mentionDetectionFailureWarnings?.has(warningKey)) {
-        if (mode === "allow-with-warning") {
-          warnMentionDetectionFailure({
-            runtime,
-            accountId: account.accountId,
-            chatId,
-            mode,
-          });
-          mentionDetectionFailureWarnings?.add(warningKey);
-        } else if (mode === "deny") {
-          warnMentionDetectionFailure({
-            runtime,
-            accountId: account.accountId,
-            chatId,
-            mode,
-          });
-          mentionDetectionFailureWarnings?.add(warningKey);
-          logVerbose(
-            core,
-            runtime,
-            `openzalo: skip group message (mention required, detection unavailable): ${chatId}`,
-          );
-          return;
-        }
-      }
-    }
-  }
 
   const fromLabel = isGroup ? `group:${chatId}` : senderName || `user:${senderId}`;
   const storePath = core.channel.session.resolveStorePath(config.session?.store, {
@@ -428,6 +504,87 @@ async function processMessage(
     },
   });
 
+  if (isGroup && isControlCommand && !canRunControlCommand) {
+    logVerbose(
+      core,
+      runtime,
+      `openzalo: drop control command from unauthorized sender ${senderId}`,
+    );
+    return;
+  }
+
+  const humanPassKey = route.sessionKey;
+  if (humanPassCommand) {
+    if (!canManageHumanPass) {
+      logVerbose(core, runtime, `openzalo: human pass command denied for sender ${senderId}`);
+      return;
+    }
+
+    const enableHumanPass = humanPassCommand === "on";
+    if (enableHumanPass) {
+      humanPassSessions?.add(humanPassKey);
+    } else {
+      humanPassSessions?.delete(humanPassKey);
+    }
+
+    const statusMessage = enableHumanPass
+      ? "Human pass enabled. I will keep reading messages for context and stop replying until you send \"human pass off\"."
+      : "Human pass disabled. Bot replies are enabled again.";
+    const notice = await sendMessageOpenzalo(chatId, statusMessage, {
+      profile: account.profile,
+      isGroup,
+    });
+    if (!notice.ok) {
+      runtime.error(
+        `openzalo: failed to send human pass status message: ${notice.error || "unknown error"}`,
+      );
+    }
+    return;
+  }
+
+  if (humanPassSessions?.has(humanPassKey)) {
+    recordMetric?.("humanPassSkips");
+    logVerbose(core, runtime, `openzalo: skip reply (human pass enabled): ${chatId}`);
+    return;
+  }
+
+  if (isGroup && shouldRequireMention) {
+    if (canDetectMention) {
+      if (!effectiveWasMentioned) {
+        logVerbose(core, runtime, `openzalo: skip group message (mention required): ${chatId}`);
+        return;
+      }
+    } else {
+      const mode = account.config.groupMentionDetectionFailure ?? "allow-with-warning";
+      const warningKey = `${account.accountId}:${chatId}:mention-detection:${mode}`;
+      if (!mentionDetectionFailureWarnings?.has(warningKey)) {
+        if (mode === "allow-with-warning") {
+          warnMentionDetectionFailure({
+            runtime,
+            accountId: account.accountId,
+            chatId,
+            mode,
+          });
+          mentionDetectionFailureWarnings?.add(warningKey);
+        } else if (mode === "deny") {
+          warnMentionDetectionFailure({
+            runtime,
+            accountId: account.accountId,
+            chatId,
+            mode,
+          });
+          mentionDetectionFailureWarnings?.add(warningKey);
+          logVerbose(
+            core,
+            runtime,
+            `openzalo: skip group message (mention required, detection unavailable): ${chatId}`,
+          );
+          return;
+        }
+      }
+    }
+  }
+
   const { onModelSelected, ...prefixOptions } = createReplyPrefixOptions({
     cfg: config,
     agentId: route.agentId,
@@ -443,9 +600,10 @@ async function processMessage(
   const shouldSendFailureNotice = account.config.sendFailureNotice !== false;
   const failureNoticeMessage = account.config.sendFailureMessage?.trim()
     ? account.config.sendFailureMessage.trim()
-    : "Some problem occurred, could not send a reply.";
+    : OPENZALO_DEFAULT_FAILURE_NOTICE_MESSAGE;
 
   let hadDispatchError = false;
+  let hadTypingError = false;
   let sentReply = false;
   const typingCallbacks = createTypingCallbacks({
     start: async () => {
@@ -455,7 +613,8 @@ async function processMessage(
       }
     },
     onStartError: (err) => {
-      hadDispatchError = true;
+      hadTypingError = true;
+      recordMetric?.("typingFailures");
       logTypingFailure({
         log: (message) => runtime.log?.(`[openzalo] ${message}`),
         channel: "openzalo",
@@ -487,10 +646,18 @@ async function processMessage(
         }
         if (outcome.failed) {
           hadDispatchError = true;
+          recordMetric?.("dispatchFailures");
+          if (outcome.textChunkFailures > 0) {
+            recordMetric?.("textChunkFailures", outcome.textChunkFailures);
+          }
+          if (outcome.mediaFailures > 0) {
+            recordMetric?.("mediaFailures", outcome.mediaFailures);
+          }
         }
       },
       onError: (err, info) => {
         hadDispatchError = true;
+        recordMetric?.("dispatchFailures");
         runtime.error?.(`[${account.accountId}] Openzalo ${info.kind} reply failed: ${String(err)}`);
       },
       onReplyStart: typingCallbacks.onReplyStart,
@@ -509,18 +676,22 @@ async function processMessage(
     });
   } catch (err) {
     hadDispatchError = true;
+    recordMetric?.("dispatchFailures");
     runtime.error?.(`[${account.accountId}] openzalo dispatch failed: ${String(err)}`);
   } finally {
     markDispatchIdle();
   }
 
-  if (hadDispatchError && !sentReply && shouldSendFailureNotice) {
+  if ((hadDispatchError || hadTypingError) && !sentReply && shouldSendFailureNotice) {
     const notice = await sendMessageOpenzalo(chatId, failureNoticeMessage, {
       profile: account.profile,
       isGroup,
     });
     if (!notice.ok) {
+      recordMetric?.("failureNoticeFailures");
       runtime.error(`openzalo: failed to send failure notice: ${notice.error || "unknown error"}`);
+    } else {
+      recordMetric?.("failureNoticesSent");
     }
   }
 }
@@ -534,15 +705,27 @@ async function deliverOpenzaloReply(params: {
   core: OpenzaloCoreRuntime;
   config: OpenClawConfig;
   accountId?: string;
-  statusSink?: (patch: { lastInboundAt?: number; lastOutboundAt?: number }) => void;
+  statusSink?: (patch: OpenzaloStatusPatch) => void;
   tableMode?: MarkdownTableMode;
 }): Promise<OpenzaloDispatchOutcome> {
   const { payload, profile, chatId, isGroup, runtime, core, config, accountId, statusSink } =
     params;
   let sent = false;
   let failed = false;
+  let textChunkFailures = 0;
+  let mediaFailures = 0;
   const tableMode = params.tableMode ?? "code";
   const text = core.channel.text.convertMarkdownTables(payload.text ?? "", tableMode);
+  const configuredTextLimit = core.channel.text.resolveTextChunkLimit(config, "openzalo", accountId, {
+    fallbackLimit: OPENZALO_TEXT_LIMIT,
+  });
+  const textLimit = Math.min(configuredTextLimit, OPENZALO_TEXT_LIMIT);
+  const maxBytes = resolveChannelMediaMaxBytes({
+    cfg: config,
+    resolveChannelLimitMb: ({ cfg, accountId }) =>
+      cfg.channels?.openzalo?.accounts?.[accountId]?.mediaMaxMb ?? cfg.channels?.openzalo?.mediaMaxMb,
+    accountId,
+  });
 
   const mediaList = payload.mediaUrls?.length
     ? payload.mediaUrls
@@ -560,38 +743,47 @@ async function deliverOpenzaloReply(params: {
         profile,
         mediaUrl,
         isGroup,
+        maxChars: textLimit,
+        maxBytes,
       });
       if (result.ok) {
         statusSink?.({ lastOutboundAt: Date.now() });
         sent = true;
       } else {
         failed = true;
+        mediaFailures += 1;
         runtime.error(`Openzalo media send failed: ${result.error || "Unknown error"}`);
       }
     }
-    return { sent, failed };
+    return { sent, failed, textChunkFailures, mediaFailures };
   }
 
   if (text) {
     const chunkMode = core.channel.text.resolveChunkMode(config, "openzalo", accountId);
     const chunks = core.channel.text.chunkMarkdownTextWithMode(
       text,
-      ZALOUSER_TEXT_LIMIT,
+      textLimit,
       chunkMode,
     );
     logVerbose(core, runtime, `Sending ${chunks.length} text chunk(s) to ${chatId}`);
     for (const chunk of chunks) {
-      const result = await sendMessageOpenzalo(chatId, chunk, { profile, isGroup });
+      const result = await sendMessageOpenzalo(chatId, chunk, {
+        profile,
+        isGroup,
+        maxChars: textLimit,
+        maxBytes,
+      });
       if (result.ok) {
         statusSink?.({ lastOutboundAt: Date.now() });
         sent = true;
       } else {
         failed = true;
+        textChunkFailures += 1;
         runtime.error(`Openzalo message send failed: ${result.error || "Unknown error"}`);
       }
     }
   }
-  return { sent, failed };
+  return { sent, failed, textChunkFailures, mediaFailures };
 }
 
 export async function monitorOpenzaloProvider(
@@ -601,6 +793,22 @@ export async function monitorOpenzaloProvider(
   const { abortSignal, statusSink, runtime } = options;
 
   const core = getOpenzaloRuntime();
+  const metrics: OpenzaloMetricCounters = {
+    dispatchFailures: 0,
+    typingFailures: 0,
+    textChunkFailures: 0,
+    mediaFailures: 0,
+    failureNoticesSent: 0,
+    failureNoticeFailures: 0,
+    humanPassSkips: 0,
+  };
+  const recordMetric = (name: OpenzaloMetricName, delta = 1): void => {
+    if (delta <= 0) {
+      return;
+    }
+    metrics[name] += delta;
+    statusSink?.({ [name]: metrics[name] } as OpenzaloStatusPatch);
+  };
   let stopped = false;
   let proc: ChildProcess | null = null;
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
@@ -697,6 +905,7 @@ export async function monitorOpenzaloProvider(
   }
 
   const mentionDetectionFailureWarnings = new Set<string>();
+  const humanPassSessions = new Set<string>();
 
   const stop = () => {
     stopped = true;
@@ -737,6 +946,8 @@ export async function monitorOpenzaloProvider(
           runtime,
           statusSink,
           mentionDetectionFailureWarnings,
+          humanPassSessions,
+          recordMetric,
         ).catch((err) => {
           runtime.error(`[${account.accountId}] Failed to process message: ${String(err)}`);
         });

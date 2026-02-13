@@ -11,7 +11,11 @@ import {
   promptAccountId,
   promptChannelAccessConfig,
 } from "openclaw/plugin-sdk";
-import type { ZcaFriend, ZcaGroup } from "./types.js";
+import type {
+  OpenzaloGroupMentionDetectionFailureMode,
+  ZcaFriend,
+  ZcaGroup,
+} from "./types.js";
 import {
   listOpenzaloAccountIds,
   resolveDefaultOpenzaloAccountId,
@@ -19,6 +23,7 @@ import {
   checkZcaAuthenticated,
 } from "./accounts.js";
 import { runOpenzca, runOpenzcaInteractive, checkOpenzcaInstalled, parseJsonOutput } from "./openzca.js";
+import { OPENZALO_DEFAULT_FAILURE_NOTICE_MESSAGE } from "./constants.js";
 
 const channel = "openzalo" as const;
 
@@ -233,6 +238,45 @@ function setOpenzaloGroupAllowlist(
             ...cfg.channels?.openzalo?.accounts?.[accountId],
             enabled: cfg.channels?.openzalo?.accounts?.[accountId]?.enabled ?? true,
             groups,
+          },
+        },
+      },
+    },
+  } as OpenClawConfig;
+}
+
+function patchOpenzaloAccountConfig(
+  cfg: OpenClawConfig,
+  accountId: string,
+  patch: Record<string, unknown>,
+): OpenClawConfig {
+  if (accountId === DEFAULT_ACCOUNT_ID) {
+    return {
+      ...cfg,
+      channels: {
+        ...cfg.channels,
+        openzalo: {
+          ...cfg.channels?.openzalo,
+          enabled: true,
+          ...patch,
+        },
+      },
+    } as OpenClawConfig;
+  }
+
+  return {
+    ...cfg,
+    channels: {
+      ...cfg.channels,
+      openzalo: {
+        ...cfg.channels?.openzalo,
+        enabled: true,
+        accounts: {
+          ...cfg.channels?.openzalo?.accounts,
+          [accountId]: {
+            ...cfg.channels?.openzalo?.accounts?.[accountId],
+            enabled: cfg.channels?.openzalo?.accounts?.[accountId]?.enabled ?? true,
+            ...patch,
           },
         },
       },
@@ -498,6 +542,64 @@ export const openzaloOnboardingAdapter: ChannelOnboardingAdapter = {
         next = setOpenzaloGroupAllowlist(next, accountId, keys);
       }
     }
+
+    const advanced = resolveOpenzaloAccountSync({ cfg: next, accountId }).config;
+    const effectiveGroupPolicy = advanced.groupPolicy ?? "open";
+    let groupRequireMention = advanced.groupRequireMention ?? true;
+    let mentionFailureMode: OpenzaloGroupMentionDetectionFailureMode =
+      advanced.groupMentionDetectionFailure ?? "deny";
+
+    if (effectiveGroupPolicy !== "disabled") {
+      groupRequireMention = await prompter.confirm({
+        message: "Require @mention before replying in group chats?",
+        initialValue: groupRequireMention,
+      });
+      next = patchOpenzaloAccountConfig(next, accountId, { groupRequireMention });
+
+      if (groupRequireMention) {
+        const allowOnDetectionFailure = await prompter.confirm({
+          message: "If mention detection fails, still allow processing?",
+          initialValue: mentionFailureMode !== "deny",
+        });
+
+        if (!allowOnDetectionFailure) {
+          mentionFailureMode = "deny";
+        } else {
+          const warnOnFallback = await prompter.confirm({
+            message: "Log warning when mention detection fallback is used?",
+            initialValue: mentionFailureMode === "allow-with-warning",
+          });
+          mentionFailureMode = warnOnFallback ? "allow-with-warning" : "allow";
+        }
+
+        next = patchOpenzaloAccountConfig(next, accountId, {
+          groupMentionDetectionFailure: mentionFailureMode,
+        });
+      }
+    }
+
+    const sendFailureNoticeCurrent = advanced.sendFailureNotice !== false;
+    const sendFailureNotice = await prompter.confirm({
+      message: "Send fallback error message when reply dispatch fails?",
+      initialValue: sendFailureNoticeCurrent,
+    });
+
+    let sendFailureMessage =
+      advanced.sendFailureMessage?.trim() || OPENZALO_DEFAULT_FAILURE_NOTICE_MESSAGE;
+    if (sendFailureNotice) {
+      const enteredMessage = await prompter.text({
+        message: "Fallback error message text",
+        placeholder: OPENZALO_DEFAULT_FAILURE_NOTICE_MESSAGE,
+        initialValue: sendFailureMessage,
+        validate: (value) => (String(value ?? "").trim() ? undefined : "Required"),
+      });
+      sendFailureMessage = String(enteredMessage).trim();
+    }
+
+    next = patchOpenzaloAccountConfig(next, accountId, {
+      sendFailureNotice,
+      ...(sendFailureNotice ? { sendFailureMessage } : {}),
+    });
 
     return { cfg: next, accountId };
   },

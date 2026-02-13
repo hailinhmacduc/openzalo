@@ -83,10 +83,19 @@ export type OpenzaloGroupMentionDetectionFailureMode =
   | "deny"
   | "allow-with-warning";
 
+export type OpenzaloActionsConfig = {
+  messages?: boolean;
+  reactions?: boolean;
+};
+
 export type OpenzaloAccountConfig = {
   enabled?: boolean;
   name?: string;
   profile?: string;
+  actions?: OpenzaloActionsConfig;
+  textChunkLimit?: number;
+  chunkMode?: "length" | "newline";
+  mediaMaxMb?: number;
   dmPolicy?: "pairing" | "allowlist" | "open" | "disabled";
   allowFrom?: Array<string | number>;
   groupPolicy?: "open" | "allowlist" | "disabled";
@@ -103,6 +112,10 @@ export type OpenzaloConfig = {
   enabled?: boolean;
   name?: string;
   profile?: string;
+  actions?: OpenzaloActionsConfig;
+  textChunkLimit?: number;
+  chunkMode?: "length" | "newline";
+  mediaMaxMb?: number;
   defaultAccount?: string;
   dmPolicy?: "pairing" | "allowlist" | "open" | "disabled";
   allowFrom?: Array<string | number>;

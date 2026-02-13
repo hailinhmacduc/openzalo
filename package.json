@@ -3,11 +3,17 @@
   "version": "2026.2.12",
   "description": "OpenClaw Zalo Personal Account plugin via openzca",
   "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
   "dependencies": {
-    "@sinclair/typebox": "0.34.48"
+    "@sinclair/typebox": "0.34.48",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
-    "openclaw": "workspace:*"
+    "@types/node": "^24.5.2",
+    "openclaw": "^2026.2.12",
+    "typescript": "^5.9.2"
   },
   "openclaw": {
     "extensions": [

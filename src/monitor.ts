@@ -1043,7 +1043,9 @@ async function processMessage(
   }
 
   if (isGroup && shouldRequireMention) {
-    if (canDetectMention) {
+    if (shouldBypassMention) {
+      logVerbose(core, runtime, `openzalo: bypass mention gating for authorized control command: ${chatId}`);
+    } else if (canDetectMention) {
       if (!effectiveWasMentioned) {
         logVerbose(core, runtime, `openzalo: skip group message (mention required): ${chatId}`);
         return;

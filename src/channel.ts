@@ -162,14 +162,35 @@ type OpenzaloActionsConfig = {
 };
 
 function buildOpenzaloThreadingToolContext(params: {
-  context: { From?: string; To?: string };
+  context: { From?: string; To?: string; ChatType?: string };
   hasRepliedRef?: { value: boolean };
 }): { currentChannelId?: string; hasRepliedRef?: { value: boolean } } {
-  const currentChannelId = params.context.From?.trim() || params.context.To?.trim() || undefined;
+  const currentChannelId =
+    coerceOpenzaloThreadingTarget(params.context.From, params.context.ChatType) ||
+    coerceOpenzaloThreadingTarget(params.context.To, params.context.ChatType) ||
+    undefined;
   return {
     currentChannelId,
     hasRepliedRef: params.hasRepliedRef,
   };
+}
+
+function coerceOpenzaloThreadingTarget(rawTarget?: string, chatType?: string): string | undefined {
+  const trimmed = rawTarget?.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  if ((chatType ?? "").trim().toLowerCase() !== "group") {
+    return trimmed;
+  }
+  const parsed = parseOpenzaloActionTarget(trimmed);
+  if (!parsed.threadId || parsed.isGroup) {
+    return trimmed;
+  }
+  if (/^(openzalo|zlu):/i.test(trimmed)) {
+    return `openzalo:group:${parsed.threadId}`;
+  }
+  return `group:${parsed.threadId}`;
 }
 
 function normalizeOpenzaloTarget(rawTarget: string): string {

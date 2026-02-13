@@ -30,6 +30,14 @@ export type ZcaGroup = {
   memberCount?: number;
 };
 
+export type ZcaMention = {
+  uid?: string;
+  pos?: number;
+  len?: number;
+  type?: number;
+  text?: string;
+};
+
 export type ZcaMessage = {
   threadId: string;
   msgId?: string;
@@ -37,11 +45,17 @@ export type ZcaMessage = {
   type: number;
   content: string;
   timestamp: number;
+  mentions?: ZcaMention[];
+  mentionIds?: string[];
   metadata?: {
     isGroup: boolean;
     threadName?: string;
     senderName?: string;
+    senderDisplayName?: string;
     fromId?: string;
+    mentions?: ZcaMention[];
+    mentionIds?: string[];
+    mentionCount?: number;
   };
 };
 

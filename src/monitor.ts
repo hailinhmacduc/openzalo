@@ -240,6 +240,77 @@ function parseHumanPassCommand(raw: string): HumanPassCommand | null {
   return null;
 }
 
+function normalizeMentionUid(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed || undefined;
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  return undefined;
+}
+
+function extractMentionIds(message: ZcaMessage): { mentionIds: string[]; hasStructuredMentionData: boolean } {
+  const ids = new Set<string>();
+  let hasStructuredMentionData = false;
+
+  const collectMentionIds = (value: unknown): void => {
+    if (!Array.isArray(value)) {
+      return;
+    }
+    hasStructuredMentionData = true;
+    for (const item of value) {
+      const uid = normalizeMentionUid(item);
+      if (uid) {
+        ids.add(uid);
+      }
+    }
+  };
+
+  const collectMentions = (value: unknown): void => {
+    if (!Array.isArray(value)) {
+      return;
+    }
+    hasStructuredMentionData = true;
+    for (const item of value) {
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const uid = normalizeMentionUid((item as { uid?: unknown }).uid);
+      if (uid) {
+        ids.add(uid);
+      }
+    }
+  };
+
+  collectMentionIds(message.mentionIds);
+  collectMentions(message.mentions);
+  collectMentionIds(message.metadata?.mentionIds);
+  collectMentions(message.metadata?.mentions);
+
+  return { mentionIds: Array.from(ids), hasStructuredMentionData };
+}
+
+async function resolveOpenzcaUserId(
+  profile: string,
+  runtime: RuntimeEnv,
+): Promise<string | undefined> {
+  const result = await runOpenzca(["me", "info", "-j"], { profile, timeout: 10000 });
+  if (!result.ok) {
+    runtime.log?.(`[openzalo] failed to resolve bot user id for profile=${profile}: ${result.stderr}`);
+    return undefined;
+  }
+
+  const parsed = parseJsonOutput<{ userId?: unknown }>(result.stdout);
+  const userId = normalizeMentionUid(parsed?.userId);
+  if (!userId) {
+    runtime.log?.(`[openzalo] could not parse bot user id from me info for profile=${profile}`);
+    return undefined;
+  }
+  return userId;
+}
+
 async function startOpenzcaListener(
   runtime: RuntimeEnv,
   profile: string,
@@ -310,6 +381,7 @@ async function processMessage(
   config: OpenClawConfig,
   core: OpenzaloCoreRuntime,
   runtime: RuntimeEnv,
+  botUserId: string | undefined,
   statusSink?: (patch: OpenzaloStatusPatch) => void,
   mentionDetectionFailureWarnings?: Set<string>,
   humanPassSessions?: Set<string>,
@@ -435,11 +507,15 @@ async function processMessage(
     },
   });
 
-  const mentionRegexes = core.channel.mentions.buildMentionRegexes(config, route.agentId);
-  if (mentionRegexes.length === 0 && route.agentId) {
-    const escapedAgentId = route.agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    mentionRegexes.push(new RegExp(`\\b@?${escapedAgentId}\\b`, "i"));
-  }
+  const mentionInfo = extractMentionIds(message);
+  const normalizedBotUserId = normalizeMentionUid(botUserId);
+  const canDetectMentionByUid = Boolean(
+    isGroup && normalizedBotUserId && mentionInfo.hasStructuredMentionData,
+  );
+  const wasMentionedByUid =
+    canDetectMentionByUid && normalizedBotUserId
+      ? mentionInfo.mentionIds.includes(normalizedBotUserId)
+      : false;
   const shouldRequireMention = isGroup
       ? core.channel.groups.resolveRequireMention({
           cfg: config,
@@ -448,12 +524,9 @@ async function processMessage(
           groupId: chatId,
         })
       : false;
-  const wasMentioned = isGroup
-    ? core.channel.mentions.matchesMentionPatterns(rawBody, mentionRegexes)
-    : false;
   const shouldBypassMention = isControlCommand && shouldRequireMention && canRunControlCommand;
-  const canDetectMention = mentionRegexes.length > 0;
-  const effectiveWasMentioned = shouldBypassMention || wasMentioned;
+  const canDetectMention = canDetectMentionByUid;
+  const effectiveWasMentioned = shouldBypassMention || wasMentionedByUid;
 
   const fromLabel = isGroup ? `group:${chatId}` : senderName || `user:${senderId}`;
   const storePath = core.channel.session.resolveStorePath(config.session?.store, {
@@ -906,6 +979,16 @@ export async function monitorOpenzaloProvider(
 
   const mentionDetectionFailureWarnings = new Set<string>();
   const humanPassSessions = new Set<string>();
+  const botUserId = await resolveOpenzcaUserId(account.profile, runtime);
+  if (botUserId) {
+    logVerbose(core, runtime, `[${account.accountId}] resolved bot user id=${botUserId}`);
+  } else {
+    logVerbose(
+      core,
+      runtime,
+      `[${account.accountId}] bot user id unavailable; structured mention detection is unavailable`,
+    );
+  }
 
   const stop = () => {
     stopped = true;
@@ -944,6 +1027,7 @@ export async function monitorOpenzaloProvider(
           config,
           core,
           runtime,
+          botUserId,
           statusSink,
           mentionDetectionFailureWarnings,
           humanPassSessions,

@@ -338,28 +338,36 @@ function resolveControlCommandBody(params: {
   botUserId?: string;
   wasMentionedByUid: boolean;
 }): string {
+  const rawTrimmed = params.rawBody.trim();
   const stripped = stripBotMentionsFromBody({
     rawBody: params.rawBody,
     message: params.message,
     botUserId: params.botUserId,
   });
-  if (stripped) {
+  if (stripped && stripped !== rawTrimmed) {
     return stripped;
+  }
+
+  // Fallback for text-only mentions like "@Thư /new" when structured mention
+  // offsets are not present in the inbound payload.
+  const mentionPrefixedCommand = rawTrimmed.match(/^@\S+(?:\s+@\S+)*\s+(\/[a-z][\s\S]*)$/iu);
+  if (mentionPrefixedCommand?.[1]) {
+    return mentionPrefixedCommand[1].trim();
   }
 
   // Fallback: when explicit mention is known but mention text offsets are unavailable,
   // attempt to parse command token from first slash.
   if (params.wasMentionedByUid) {
-    const slashIndex = params.rawBody.indexOf("/");
+    const slashIndex = rawTrimmed.indexOf("/");
     if (slashIndex >= 0) {
-      const candidate = params.rawBody.slice(slashIndex).trim();
+      const candidate = rawTrimmed.slice(slashIndex).trim();
       if (/^\/[a-z]/i.test(candidate)) {
         return candidate;
       }
     }
   }
 
-  return params.rawBody.trim();
+  return stripped || rawTrimmed;
 }
 
 function normalizeMentionUid(value: unknown): string | undefined {

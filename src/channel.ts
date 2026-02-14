@@ -454,6 +454,19 @@ function extractUndoRefFromRecentRow(row: unknown): {
   return { msgId, cliMsgId, senderId, ts };
 }
 
+function isOwnRecentMessageSender(senderId: string | undefined, botUserId?: string): boolean {
+  if (!senderId) {
+    return true;
+  }
+  if (senderId === "0") {
+    return true;
+  }
+  if (!botUserId) {
+    return true;
+  }
+  return senderId === botUserId;
+}
+
 async function resolveLatestOwnUndoRefFromRecent(params: {
   profile: string;
   threadId: string;
@@ -488,7 +501,7 @@ async function resolveLatestOwnUndoRefFromRecent(params: {
     if (!parsed.msgId || !parsed.cliMsgId) {
       continue;
     }
-    if (params.botUserId && parsed.senderId && parsed.senderId !== params.botUserId) {
+    if (!isOwnRecentMessageSender(parsed.senderId, params.botUserId)) {
       continue;
     }
     const tsScore = typeof parsed.ts === "number" ? parsed.ts : Number.MAX_SAFE_INTEGER - index;

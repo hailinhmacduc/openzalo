@@ -20,7 +20,12 @@ import type {
   ZcaMessage,
 } from "./types.js";
 import { getOpenzaloRuntime } from "./runtime.js";
-import { readRecentMessagesOpenzalo, sendMessageOpenzalo, sendTypingOpenzalo } from "./send.js";
+import {
+  readRecentMessagesOpenzalo,
+  sendMessageOpenzalo,
+  sendTypingOpenzalo,
+  unsendMessageOpenzalo,
+} from "./send.js";
 import { parseJsonOutput, runOpenzca, runOpenzcaStreaming } from "./openzca.js";
 import {
   OPENZALO_DEFAULT_GROUP_HISTORY_LIMIT,
@@ -243,6 +248,29 @@ function classifyOpenzcaStderr(text: string): "info" | "warn" | "error" {
 
 function shouldRestartOnOpenzcaListenerStderr(text: string): boolean {
   return /(?:^|\s)listen\.(?:closed|error|disconnected|stop)\b/i.test(text);
+}
+
+function normalizeIntentText(text: string): string {
+  return text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function isUnsendIntent(text: string): boolean {
+  const normalized = normalizeIntentText(text);
+  if (!normalized) {
+    return false;
+  }
+  return (
+    /\bthu\s*hoi\b/.test(normalized) ||
+    /\bunsend\b/.test(normalized) ||
+    /\bundo\b/.test(normalized) ||
+    /\brecall\b/.test(normalized) ||
+    /\bretract\b/.test(normalized)
+  );
 }
 
 function parseHumanPassCommand(raw: string): HumanPassCommand | null {
@@ -1328,6 +1356,37 @@ async function processMessage(
         }
       }
     }
+  }
+
+  const unsendTriggerBody = (controlCommandBody || rawBody).trim();
+  const canAutoUnsendQuoted =
+    account.config.actions?.messages !== false &&
+    quoteContext.replyToId &&
+    quoteContext.replyToIdFull &&
+    isUnsendIntent(unsendTriggerBody);
+  if (canAutoUnsendQuoted) {
+    const result = await unsendMessageOpenzalo(
+      {
+        threadId: chatId,
+        msgId: quoteContext.replyToIdFull,
+        cliMsgId: quoteContext.replyToId,
+      },
+      {
+        profile: account.profile,
+        isGroup,
+      },
+    );
+    if (result.ok) {
+      statusSink?.({ lastOutboundAt: Date.now() });
+      await sendMessageOpenzalo(chatId, "Da thu hoi tin nhan duoc reply.", {
+        profile: account.profile,
+        isGroup,
+      });
+      return;
+    }
+    runtime.error(
+      `openzalo: auto unsend from reply failed msgId=${quoteContext.replyToIdFull} cliMsgId=${quoteContext.replyToId}: ${result.error ?? "unknown error"}`,
+    );
   }
 
   if (isGroup && historyLimit > 0) {

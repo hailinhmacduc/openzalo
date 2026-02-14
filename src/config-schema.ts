@@ -3,11 +3,13 @@ import { z } from "zod";
 import { OPENZALO_TEXT_LIMIT } from "./constants.js";
 
 const allowFromEntry = z.union([z.string(), z.number()]);
+const toolPolicyBySenderSchema = z.object({}).catchall(ToolPolicySchema).optional();
 
 const groupConfigSchema = z.object({
   allow: z.boolean().optional(),
   enabled: z.boolean().optional(),
   tools: ToolPolicySchema,
+  toolsBySender: toolPolicyBySenderSchema,
   requireMention: z.boolean().optional(),
 });
 

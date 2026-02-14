@@ -172,6 +172,23 @@ channels:
     groupMentionDetectionFailure: deny
 ```
 
+Restrict sensitive tool actions in a group to only your sender identity:
+
+```yaml
+channels:
+  openzalo:
+    groupPolicy: allowlist
+    groups:
+      "<approved-group-id>":
+        allow: true
+        requireMention: true
+        tools:
+          deny: ["message", "openzalo"] # default for everyone in this group
+        toolsBySender:
+          "<your-zalo-user-id>":
+            alsoAllow: ["message", "openzalo"] # only you can run send/unsend-style actions
+```
+
 ## Commands
 
 ### Authentication

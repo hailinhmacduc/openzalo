@@ -92,6 +92,8 @@ Rationale:
   - When upstream transcript is clear and actionable, execute directly without confirmation paraphrase.
   - Ask clarification only when transcript is ambiguous, incomplete, or lacks required target/parameters.
   - For direct factual requests (for example "bây giờ là mấy giờ"), return the answer immediately.
+- Security hardening for group actions:
+  - Use per-group `tools.deny` plus `toolsBySender` override so sensitive actions (`message`, `openzalo`) are blocked for everyone except approved sender IDs.
 
 ## 7) Note on current CLI workspace state
 

@@ -1,3 +1,5 @@
+import type { GroupToolPolicyBySenderConfig, GroupToolPolicyConfig } from "openclaw/plugin-sdk";
+
 // openzca wrapper types
 export type ZcaRunOptions = {
   profile?: string;
@@ -148,10 +150,8 @@ export type ListenOptions = CommonOptions & {
 export type OpenzaloGroupConfig = {
   allow?: boolean;
   enabled?: boolean;
-  tools?: {
-    allow?: string[];
-    deny?: string[];
-  };
+  tools?: GroupToolPolicyConfig;
+  toolsBySender?: GroupToolPolicyBySenderConfig;
   requireMention?: boolean;
 };
 

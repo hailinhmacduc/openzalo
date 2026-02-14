@@ -20,6 +20,7 @@ import {
   normalizeAccountId,
   readNumberParam,
   readStringParam,
+  resolveToolsBySender,
   resolveChannelMediaMaxBytes,
   setAccountEnabledInConfigSection,
 } from "openclaw/plugin-sdk";
@@ -117,7 +118,20 @@ function resolveOpenzaloGroupToolPolicy(
   ].filter((value): value is string => Boolean(value));
   for (const key of candidates) {
     const entry = groups[key];
-    if (entry?.tools) {
+    if (!entry) {
+      continue;
+    }
+    const senderPolicy = resolveToolsBySender({
+      toolsBySender: entry.toolsBySender,
+      senderId: params.senderId,
+      senderName: params.senderName,
+      senderUsername: params.senderUsername,
+      senderE164: params.senderE164,
+    });
+    if (senderPolicy) {
+      return senderPolicy;
+    }
+    if (entry.tools) {
       return entry.tools;
     }
   }

@@ -262,6 +262,30 @@ type OpenzaloMentionSegment = {
   text?: string;
 };
 
+function normalizeControlCommandCandidate(raw: string): string {
+  const cleaned = raw
+    .replace(/[\u200B-\u200D\u2060\uFEFF]/g, "")
+    .replace(/\u00A0/g, " ")
+    .trim();
+  if (!cleaned.startsWith("/")) {
+    return cleaned;
+  }
+  const match = cleaned.match(/^(\/[a-z][a-z0-9-]*)([\s\S]*)$/i);
+  if (!match) {
+    return cleaned;
+  }
+  const command = match[1]!.toLowerCase();
+  const rest = match[2]?.trim() ?? "";
+  if (!rest) {
+    return command;
+  }
+  // Treat "/new!!!" / "/reset..." as bare control commands.
+  if ((command === "/new" || command === "/reset") && !/[a-z0-9]/i.test(rest)) {
+    return command;
+  }
+  return `${command} ${rest}`;
+}
+
 function collectBotMentionSegments(message: ZcaMessage, botUserId?: string): OpenzaloMentionSegment[] {
   const normalizedBotUserId = normalizeMentionUid(botUserId);
   if (!normalizedBotUserId) {
@@ -343,21 +367,22 @@ function resolveControlCommandBody(params: {
   botUserId?: string;
   wasMentionedByUid: boolean;
 }): string {
-  const rawTrimmed = params.rawBody.trim();
+  const rawTrimmed = normalizeControlCommandCandidate(params.rawBody);
   const stripped = stripBotMentionsFromBody({
     rawBody: params.rawBody,
     message: params.message,
     botUserId: params.botUserId,
   });
-  if (stripped && stripped !== rawTrimmed) {
-    return stripped;
+  const strippedNormalized = normalizeControlCommandCandidate(stripped);
+  if (strippedNormalized && strippedNormalized !== rawTrimmed) {
+    return strippedNormalized;
   }
 
   // Fallback for text-only mentions like "@Thư /new" when structured mention
   // offsets are not present in the inbound payload.
   const mentionPrefixedCommand = rawTrimmed.match(/^@\S+(?:\s+@\S+)*\s+(\/[a-z][\s\S]*)$/iu);
   if (mentionPrefixedCommand?.[1]) {
-    return mentionPrefixedCommand[1].trim();
+    return normalizeControlCommandCandidate(mentionPrefixedCommand[1]);
   }
 
   // Fallback for mention display names that include spaces (for example "@Nguyen Van A /new")
@@ -367,7 +392,7 @@ function resolveControlCommandBody(params: {
     if (slashIndex > 0) {
       const candidate = rawTrimmed.slice(slashIndex).trim();
       if (/^\/[a-z]/i.test(candidate)) {
-        return candidate;
+        return normalizeControlCommandCandidate(candidate);
       }
     }
   }
@@ -379,12 +404,12 @@ function resolveControlCommandBody(params: {
     if (slashIndex >= 0) {
       const candidate = rawTrimmed.slice(slashIndex).trim();
       if (/^\/[a-z]/i.test(candidate)) {
-        return candidate;
+        return normalizeControlCommandCandidate(candidate);
       }
     }
   }
 
-  return stripped || rawTrimmed;
+  return strippedNormalized || rawTrimmed;
 }
 
 function normalizeMentionUid(value: unknown): string | undefined {
@@ -1111,6 +1136,15 @@ async function processMessage(
   const shouldBypassMention = isControlCommand && shouldRequireMention && canRunControlCommand;
   const canDetectMention = canDetectMentionByUid;
   const effectiveWasMentioned = shouldBypassMention || wasMentionedByUid;
+  if (isGroup && /\/(?:new|reset)\b/i.test(rawBody)) {
+    const rawPreview = rawBody.replace(/\s+/g, " ").slice(0, 120);
+    const parsedPreview = (controlCommandBody || "").replace(/\s+/g, " ").slice(0, 120);
+    logVerbose(
+      core,
+      runtime,
+      `openzalo: control parse raw="${rawPreview}" parsed="${parsedPreview}" builtin=${String(isBuiltinControlCommand)} auth=${String(commandAuthorized)} mentionedByUid=${String(wasMentionedByUid)} detectByUid=${String(canDetectMentionByUid)}`,
+    );
+  }
 
   const senderLabel = buildSenderLabel(senderId, senderName);
   const fromLabel = senderLabel;

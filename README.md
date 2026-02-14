@@ -322,6 +322,18 @@ The extension registers a `openzalo` tool for AI agents:
 }
 ```
 
+`action=send` also supports media/file upload via `media`/`path`/`filePath`:
+
+```json
+{
+  "action": "send",
+  "threadId": "user:123456",
+  "media": "/Users/tuyenhx/Downloads/report.pdf",
+  "message": "Here is the PDF.",
+  "profile": "default"
+}
+```
+
 For group chats, prefer explicit group targets to avoid ambiguity:
 
 ```json

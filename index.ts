@@ -20,8 +20,9 @@ const plugin = {
       label: "Zalo Personal",
       description:
         "Send messages and access data via Zalo personal account. " +
-        'When sending to groups, use "group:<id>" targets (or set isGroup=true for bare numeric ids). ' +
-        "Actions: send (text message), image (send image URL), link (send link), " +
+        'For targets, prefer "user:<id>" or "group:<id>" (or set isGroup=true for bare numeric IDs). ' +
+        "Action send supports plain text and media/file upload (image/video/voice/pdf/doc/xlsx/zip...) via media/path/filePath. " +
+        "Actions: send, image, link, " +
         "friends (list/search friends), groups (list groups), group-members (list members in a group), " +
         "me (profile info), status (auth check).",
       parameters: OpenzaloToolSchema,

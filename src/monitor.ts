@@ -373,13 +373,19 @@ function resolveControlCommandBody(params: {
   wasMentionedByUid: boolean;
 }): string {
   const rawTrimmed = normalizeControlCommandCandidate(params.rawBody);
+  if (rawTrimmed.startsWith("/")) {
+    return rawTrimmed;
+  }
   const stripped = stripBotMentionsFromBody({
     rawBody: params.rawBody,
     message: params.message,
     botUserId: params.botUserId,
   });
   const strippedNormalized = normalizeControlCommandCandidate(stripped);
-  if (strippedNormalized && strippedNormalized !== rawTrimmed) {
+  // Trust structured mention stripping only when it produces a command token.
+  // Some payloads provide mention pos/len offsets that can clip adjacent chars
+  // (for example "@Thư /new" -> "ew"), so avoid early-returning non-command tails.
+  if (strippedNormalized.startsWith("/")) {
     return strippedNormalized;
   }
 

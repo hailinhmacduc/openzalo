@@ -328,7 +328,7 @@ The extension registers a `openzalo` tool for AI agents:
 {
   "action": "send",
   "threadId": "user:123456",
-  "media": "/Users/tuyenhx/Downloads/report.pdf",
+  "media": "~/Downloads/report.pdf",
   "message": "Here is the PDF.",
   "profile": "default"
 }
@@ -340,7 +340,7 @@ For group chats, prefer explicit group targets to avoid ambiguity:
 {
   "action": "image",
   "threadId": "group:5316386947725214403",
-  "url": "/Users/tuyenhx/.openclaw/workspace/avatars/em-thu-ky-avatar.jpg",
+  "url": "~/.openclaw/workspace/avatars/em-thu-ky-avatar.jpg",
   "message": "Avatar em Thu ne",
   "profile": "default"
 }

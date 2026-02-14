@@ -38,7 +38,7 @@ Root causes:
 - Natural language follow-up may not include explicit target thread/group.
 - Prior send responses may not expose enough undo metadata for the model to reliably chain actions.
 
-## 3) openzca CLI constraints and capabilities (from `/Users/tuyenhx/Workspace/cli/openzca`)
+## 3) openzca CLI constraints and capabilities (from a local `openzca` checkout)
 
 ### Constraints
 - Undo command requires full tuple:
@@ -70,7 +70,7 @@ Implication:
 
 ## 5) Recommended CLI design improvements (openzca)
 
-These are recommended next steps for `/Users/tuyenhx/Workspace/cli/openzca`:
+These are recommended next steps for the `openzca` CLI:
 - Add `msg undo-last <threadId> [-g]`:
   - internally call `msg recent`, pick latest own message, run undo.
 - Optional `msg send --json` stable output contract:
@@ -88,10 +88,14 @@ Rationale:
 - After `send`, store returned `undo` payload immediately.
 - If user says "unsend that", first try stored `undo`; if missing, call `read` with limit and recover IDs.
 - Group history default is tuned to `6` for prompt efficiency; if not enough context, call `action=read` with a higher `limit`.
+- Voice/transcript behavior:
+  - When upstream transcript is clear and actionable, execute directly without confirmation paraphrase.
+  - Ask clarification only when transcript is ambiguous, incomplete, or lacks required target/parameters.
+  - For direct factual requests (for example "bây giờ là mấy giờ"), return the answer immediately.
 
 ## 7) Note on current CLI workspace state
 
-- `/Users/tuyenhx/Workspace/cli/openzca` currently has local changes in `src/cli.ts`.
+- Local `openzca` workspace currently has local changes in `src/cli.ts`.
 - Because of existing uncommitted work, CLI edits should be coordinated carefully before patching.
 
 ## 8) Send succeeded but UI still shows error (false negative)

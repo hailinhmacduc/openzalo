@@ -112,7 +112,7 @@ export function collectOpenzaloStatusIssues(
       });
     }
 
-    const groupPolicy = asString(account.groupPolicy) ?? "open";
+    const groupPolicy = asString(account.groupPolicy) ?? "allowlist";
     const groupRequireMention = asBoolean(account.groupRequireMention) ?? true;
     const mentionDetectionFailureMode = asString(account.groupMentionDetectionFailure) ?? "deny";
     const groupCount = asNumber(account.groupCount) ?? 0;

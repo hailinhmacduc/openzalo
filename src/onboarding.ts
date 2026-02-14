@@ -494,7 +494,7 @@ export const openzaloOnboardingAdapter: ChannelOnboardingAdapter = {
     const accessConfig = await promptChannelAccessConfig({
       prompter,
       label: "Zalo groups",
-      currentPolicy: account.config.groupPolicy ?? "open",
+      currentPolicy: account.config.groupPolicy ?? "allowlist",
       currentEntries: Object.keys(account.config.groups ?? {}),
       placeholder: "Family, Work, 123456789",
       updatePrompt: Boolean(account.config.groups),
@@ -544,7 +544,7 @@ export const openzaloOnboardingAdapter: ChannelOnboardingAdapter = {
     }
 
     const advanced = resolveOpenzaloAccountSync({ cfg: next, accountId }).config;
-    const effectiveGroupPolicy = advanced.groupPolicy ?? "open";
+    const effectiveGroupPolicy = advanced.groupPolicy ?? "allowlist";
     let groupRequireMention = advanced.groupRequireMention ?? true;
     let mentionFailureMode: OpenzaloGroupMentionDetectionFailureMode =
       advanced.groupMentionDetectionFailure ?? "deny";

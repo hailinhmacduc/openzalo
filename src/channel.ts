@@ -746,7 +746,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
     collectWarnings: ({ account, cfg }) => {
       const warnings: string[] = [];
       const defaultGroupPolicy = cfg.channels?.defaults?.groupPolicy;
-      const groupPolicy = account.config.groupPolicy ?? defaultGroupPolicy ?? "open";
+      const groupPolicy = account.config.groupPolicy ?? defaultGroupPolicy ?? "allowlist";
       const groups = account.config.groups ?? {};
       const groupCount = Object.keys(groups).length;
       const requireMention = account.config.groupRequireMention ?? true;
@@ -1546,7 +1546,7 @@ export const openzaloPlugin: ChannelPlugin<ResolvedOpenzaloAccount> = {
         lastInboundAt: runtime?.lastInboundAt ?? null,
         lastOutboundAt: runtime?.lastOutboundAt ?? null,
         dmPolicy: account.config.dmPolicy ?? "pairing",
-        groupPolicy: account.config.groupPolicy ?? "open",
+        groupPolicy: account.config.groupPolicy ?? "allowlist",
         groupRequireMention: account.config.groupRequireMention ?? true,
         groupMentionDetectionFailure: account.config.groupMentionDetectionFailure,
         sendFailureNotice: account.config.sendFailureNotice !== false,

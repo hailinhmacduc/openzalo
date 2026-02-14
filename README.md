@@ -99,6 +99,7 @@ channels:
   openzalo:
     enabled: true
     dmPolicy: pairing # pairing | allowlist | open | disabled
+    groupPolicy: allowlist # allowlist | open | disabled
     groupRequireMention: true # require @mention in group chats
     groupMentionDetectionFailure: deny # allow | deny | allow-with-warning
     historyLimit: 6 # optional override (highest priority; set 0 to disable preload)
@@ -141,7 +142,7 @@ messages:
 If plugin `openzalo` is enabled but `channels.openzalo` is not set in config, runtime defaults are:
 
 - `dmPolicy: pairing`
-- `groupPolicy: open`
+- `groupPolicy: allowlist`
 - `groupRequireMention: true`
 - `groupMentionDetectionFailure: deny`
 - `sendFailureNotice: true`
@@ -150,7 +151,7 @@ If plugin `openzalo` is enabled but `channels.openzalo` is not set in config, ru
 Behavior summary:
 
 - Direct chat (DM): unknown users do not get normal bot replies; they receive pairing flow first.
-- Group chat: bot replies only when explicitly mentioned.
+- Group chat: bot replies only in allowlisted groups, and only when explicitly mentioned.
 - Group chat context: baseline preload is 6 messages (or configured `historyLimit`), and the window auto-expands for context-sensitive turns (for example short referential replies or quoted replies).
 - If more context is needed mid-reply, the agent can call action `read` with a higher `limit` for the same group conversation.
 - Mention detection: uses structured mention IDs from inbound payload (`mentionIds` / `mentions[].uid`) matched against bot user id.
@@ -163,7 +164,10 @@ Recommended explicit config (to avoid cross-machine ambiguity):
 channels:
   openzalo:
     dmPolicy: pairing
-    groupPolicy: open
+    groupPolicy: allowlist
+    groups:
+      "<approved-group-id>":
+        allow: true
     groupRequireMention: true
     groupMentionDetectionFailure: deny
 ```

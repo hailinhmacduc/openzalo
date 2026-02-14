@@ -42,7 +42,7 @@ export const OpenzaloToolSchema = Type.Object(
     threadId: Type.Optional(
       Type.String({
         description:
-          'Thread target for messaging. Prefer "group:<id>" or "user:<id>"; bare numeric IDs require isGroup.',
+          'Thread target for messaging. Prefer "group:<id>" or "user:<id>"; bare numeric IDs require isGroup. For cross-chat unsend, set explicit target thread first.',
       }),
     ),
     groupId: Type.Optional(Type.String({ description: "Group ID for group-member listing" })),
@@ -61,9 +61,21 @@ export const OpenzaloToolSchema = Type.Object(
         description: "Set true for group chats (required when threadId is a bare numeric group ID).",
       }),
     ),
-    msgId: Type.Optional(Type.String({ description: "Message id for unsend action" })),
-    messageId: Type.Optional(Type.String({ description: "Alias of msgId for unsend action" })),
-    cliMsgId: Type.Optional(Type.String({ description: "Client message id for unsend action" })),
+    msgId: Type.Optional(
+      Type.String({
+        description:
+          "Message id for unsend action. If unknown, read recent messages in the target thread first to collect ids.",
+      }),
+    ),
+    messageId: Type.Optional(
+      Type.String({ description: "Alias of msgId for unsend action" }),
+    ),
+    cliMsgId: Type.Optional(
+      Type.String({
+        description:
+          "Client message id for unsend action. If missing, read target thread recent history to recover cliMsgId.",
+      }),
+    ),
     clientMessageId: Type.Optional(
       Type.String({ description: "Alias of cliMsgId for unsend action" }),
     ),

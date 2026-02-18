@@ -1,6 +1,7 @@
 import { Type } from "@sinclair/typebox";
 import { runOpenzca, parseJsonOutput } from "./openzca.js";
 import {
+  getMemberInfoOpenzalo,
   sendImageOpenzalo,
   sendLinkOpenzalo,
   sendMessageOpenzalo,
@@ -16,6 +17,7 @@ const ACTIONS = [
   "friends",
   "groups",
   "group-members",
+  "member-info",
   "me",
   "status",
 ] as const;
@@ -47,6 +49,9 @@ export const OpenzaloToolSchema = Type.Object(
       }),
     ),
     groupId: Type.Optional(Type.String({ description: "Group ID for group-member listing" })),
+    userId: Type.Optional(Type.String({ description: "User ID for member-info action" })),
+    memberId: Type.Optional(Type.String({ description: "Alias of userId for member-info action" })),
+    id: Type.Optional(Type.String({ description: "Alias of userId/memberId for member-info action" })),
     message: Type.Optional(Type.String({ description: "Message text (or caption for media send)" })),
     caption: Type.Optional(Type.String({ description: "Caption for media/file send" })),
     media: Type.Optional(
@@ -91,6 +96,9 @@ type ToolParams = {
   action: (typeof ACTIONS)[number];
   threadId?: string;
   groupId?: string;
+  userId?: string;
+  memberId?: string;
+  id?: string;
   message?: string;
   caption?: string;
   media?: string;
@@ -308,6 +316,24 @@ export async function executeOpenzaloTool(
         return json(parsed ?? { raw: result.stdout });
       }
 
+      case "member-info": {
+        const userId = params.userId?.trim() || params.memberId?.trim() || params.id?.trim();
+        if (!userId) {
+          throw new Error("userId/memberId/id required for member-info action");
+        }
+        const result = await getMemberInfoOpenzalo(userId, {
+          profile: params.profile,
+        });
+        if (!result.ok) {
+          throw new Error(result.error || "Failed to get member info");
+        }
+        return json({
+          success: true,
+          userId,
+          data: result.output ?? null,
+        });
+      }
+
       case "me": {
         const result = await runOpenzca(["me", "info", "-j"], {
           profile: params.profile,
@@ -332,7 +358,7 @@ export async function executeOpenzaloTool(
       default: {
         params.action satisfies never;
         throw new Error(
-          `Unknown action: ${String(params.action)}. Valid actions: send, unsend, image, link, friends, groups, group-members, me, status`,
+          `Unknown action: ${String(params.action)}. Valid actions: send, unsend, image, link, friends, groups, group-members, member-info, me, status`,
         );
       }
     }

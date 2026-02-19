@@ -1,7 +1,6 @@
 {
   "name": "@openclaw/openzalo",
-  "version": "2026.2.18",
-  "private": true,
+  "version": "2026.2.19",
   "description": "OpenClaw OpenZalo channel plugin (personal account via openzca CLI)",
   "type": "module",
   "scripts": {
@@ -11,11 +10,32 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "openclaw": "workspace:*",
     "tsx": "^4.20.5"
   },
   "openclaw": {
     "extensions": [
       "./index.ts"
-    ]
+    ],
+    "channel": {
+      "id": "openzalo",
+      "label": "OpenZalo",
+      "selectionLabel": "OpenZalo (personal account)",
+      "detailLabel": "OpenZalo",
+      "docsPath": "/channels/openzalo",
+      "docsLabel": "openzalo",
+      "blurb": "Personal Zalo account integration via openzca CLI.",
+      "aliases": [
+        "zlu",
+        "zalo-personal"
+      ],
+      "systemImage": "message",
+      "order": 80
+    },
+    "install": {
+      "npmSpec": "@openclaw/openzalo",
+      "localPath": "extensions/openzalo",
+      "defaultChoice": "local"
+    }
   }
 }

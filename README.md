@@ -23,6 +23,14 @@ Example direct login with `openzca`:
 openzca --profile default auth login
 ```
 
+## Install (npm)
+
+Use this after `@openclaw/openzalo` is approved/published to npm:
+
+```bash
+openclaw plugins install @openclaw/openzalo
+```
+
 ## Install (local checkout)
 
 From the OpenClaw repo root:

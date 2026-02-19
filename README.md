@@ -109,9 +109,12 @@ openclaw message send --channel openzalo --target group:<groupId> --message "Hel
       },
 
       historyLimit: 12,
+      dmHistoryLimit: 12, // optional (schema-supported)
       textChunkLimit: 1800,
       chunkMode: "length", // length | newline
       blockStreaming: false,
+      mediaMaxMb: 25, // optional (schema-supported)
+      markdown: {}, // optional (schema-supported)
 
       mediaLocalRoots: [
         "/Users/<you>/.openclaw/workspace",
@@ -157,7 +160,9 @@ Profile resolution is per account. If `zcaBinary` is not set, plugin uses:
 
 - DM target: `<userId>`
 - Group target: `group:<groupId>`
-- Also accepted: `g-<groupId>`, `g:<groupId>`
+- Also accepted for groups: `g-<groupId>`, `g:<groupId>`
+- Also accepted for DM/user targets: `user:<userId>`, `dm:<userId>`, `u:<userId>`, `u-<userId>`
+- Channel prefixes like `openzalo:<target>` and `zlu:<target>` are normalized automatically.
 
 Use `group:` for explicit group sends.
 
@@ -165,10 +170,11 @@ Use `group:` for explicit group sends.
 
 - Inbound listener uses `openzca listen --raw --keep-alive`.
 - Group messages require mention by default (`requireMention: true`) unless overridden.
+- Authorized slash/bang control commands can still be processed in groups when access policy allows.
 - Pairing mode sends approval code for unknown DM senders.
 - Local media is restricted to allowed roots for safety.
 
-Default safe media roots (under `OPENCLAW_STATE_DIR` or `~/.openclaw`):
+Default safe media roots (under `OPENCLAW_STATE_DIR` or `CLAWDBOT_STATE_DIR`, fallback `~/.openclaw`):
 
 - `workspace`
 - `media`
@@ -180,4 +186,5 @@ Default safe media roots (under `OPENCLAW_STATE_DIR` or `~/.openclaw`):
 - `openzca not found`: install `openzca` or set `channels.openzalo.zcaBinary`.
 - Auth check fails: run `openclaw channels login --channel openzalo` (or `openzca --profile <id> auth login`).
 - Group message dropped: verify `groupPolicy`, `groupAllowFrom`, and `groups.<groupId>` allowlist.
+- Group message dropped with allowlist configured: check `requireMention` and mention detection.
 - Local media blocked: add absolute paths to `channels.openzalo.mediaLocalRoots`.

@@ -10,7 +10,6 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "openclaw": "workspace:*",
     "tsx": "^4.20.5"
   },
   "openclaw": {

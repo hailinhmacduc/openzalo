@@ -38,6 +38,10 @@ import {
   resolveOpenzaloGroupSenderAllowed,
   resolveOpenzaloRequireMention,
 } from "./policy.js";
+import {
+  acquireOpenzaloOutboundDedupeSlot,
+  releaseOpenzaloOutboundDedupeSlot,
+} from "./outbound-dedupe.js";
 import type { CoreConfig, OpenzaloInboundMessage, ResolvedOpenzaloAccount } from "./types.js";
 
 const CHANNEL_ID = "openzalo" as const;
@@ -227,11 +231,13 @@ function logOpenzaloCommandAllowHint(params: {
 async function deliverOpenzaloReply(params: {
   payload: ReplyPayload;
   target: string;
+  sessionKey: string;
   account: ResolvedOpenzaloAccount;
   cfg: CoreConfig;
+  runtime: RuntimeEnv;
   statusSink?: (patch: { lastOutboundAt?: number }) => void;
 }): Promise<OpenzaloSendReceipt[]> {
-  const { payload, target, account, cfg, statusSink } = params;
+  const { payload, target, sessionKey, account, cfg, runtime, statusSink } = params;
   const receipts: OpenzaloSendReceipt[] = [];
   const mediaList = payload.mediaUrls?.length
     ? payload.mediaUrls
@@ -247,17 +253,43 @@ async function deliverOpenzaloReply(params: {
   if (mediaList.length > 0) {
     let first = true;
     for (const mediaUrl of mediaList) {
-      const result = await sendMediaOpenzalo({
-        cfg,
-        account,
-        to: target,
-        mediaUrl,
-        text: first ? text : undefined,
-        mediaLocalRoots: account.config.mediaLocalRoots,
+      const caption = first ? text : undefined;
+      const dedupe = acquireOpenzaloOutboundDedupeSlot({
+        accountId: account.accountId,
+        sessionKey,
+        target,
+        kind: "media",
+        text: caption,
+        mediaRef: mediaUrl,
       });
-      receipts.push(...(result.receipts.length > 0 ? result.receipts : [result]));
-      first = false;
-      statusSink?.({ lastOutboundAt: Date.now() });
+      if (!dedupe.acquired) {
+        runtime.log?.(
+          `[${account.accountId}] openzalo skip duplicate media send (${dedupe.reason}) target=${target}`,
+        );
+        first = false;
+        continue;
+      }
+
+      let sent = false;
+      try {
+        const result = await sendMediaOpenzalo({
+          cfg,
+          account,
+          to: target,
+          mediaUrl,
+          text: caption,
+          mediaLocalRoots: account.config.mediaLocalRoots,
+        });
+        receipts.push(...(result.receipts.length > 0 ? result.receipts : [result]));
+        sent = true;
+        first = false;
+        statusSink?.({ lastOutboundAt: Date.now() });
+      } finally {
+        releaseOpenzaloOutboundDedupeSlot({
+          ticket: dedupe.ticket,
+          sent,
+        });
+      }
     }
     return receipts;
   }
@@ -275,14 +307,37 @@ async function deliverOpenzaloReply(params: {
     const finalChunks = chunks.length > 0 ? chunks : [text];
 
     for (const chunk of finalChunks) {
-      const receipt = await sendTextOpenzalo({
-        cfg,
-        account,
-        to: target,
+      const dedupe = acquireOpenzaloOutboundDedupeSlot({
+        accountId: account.accountId,
+        sessionKey,
+        target,
+        kind: "text",
         text: chunk,
       });
-      receipts.push(receipt);
-      statusSink?.({ lastOutboundAt: Date.now() });
+      if (!dedupe.acquired) {
+        runtime.log?.(
+          `[${account.accountId}] openzalo skip duplicate text send (${dedupe.reason}) target=${target}`,
+        );
+        continue;
+      }
+
+      let sent = false;
+      try {
+        const receipt = await sendTextOpenzalo({
+          cfg,
+          account,
+          to: target,
+          text: chunk,
+        });
+        receipts.push(receipt);
+        sent = true;
+        statusSink?.({ lastOutboundAt: Date.now() });
+      } finally {
+        releaseOpenzaloOutboundDedupeSlot({
+          ticket: dedupe.ticket,
+          sent,
+        });
+      }
     }
   }
 
@@ -738,8 +793,10 @@ export async function handleOpenzaloInbound(params: {
         const receipts = await deliverOpenzaloReply({
           payload,
           target: outboundTarget,
+          sessionKey: route.sessionKey,
           account,
           cfg,
+          runtime,
           statusSink,
         });
 

@@ -22,12 +22,67 @@ const OPENZALO_READY_TIMEOUT_MS = 30_000;
 const OPENZALO_READY_POLL_MS = 500;
 const OPENZALO_READY_LOG_AFTER_MS = 10_000;
 const OPENZALO_READY_LOG_INTERVAL_MS = 10_000;
+const OPENZALO_RECONNECT_INITIAL_MS = 1_000;
+const OPENZALO_RECONNECT_MAX_MS = 60_000;
+const OPENZALO_RECONNECT_FACTOR = 2;
+const OPENZALO_RECONNECT_JITTER = 0.2;
+const OPENZALO_RECONNECT_STABLE_RESET_MS = 90_000;
+const OPENZALO_WATCHDOG_IDLE_MS = 5 * 60_000;
+const OPENZALO_WATCHDOG_POLL_MS = 30_000;
 
 function toErrorText(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
   }
   return typeof error === "string" ? error : String(error);
+}
+
+function computeReconnectDelayMs(attempt: number): number {
+  const normalizedAttempt = Math.max(1, Math.floor(attempt));
+  const base = Math.min(
+    OPENZALO_RECONNECT_MAX_MS,
+    OPENZALO_RECONNECT_INITIAL_MS * OPENZALO_RECONNECT_FACTOR ** (normalizedAttempt - 1),
+  );
+  const jitterWindow = base * OPENZALO_RECONNECT_JITTER;
+  const jitter = (Math.random() * 2 - 1) * jitterWindow;
+  return Math.max(0, Math.round(base + jitter));
+}
+
+function attachAbort(parent: AbortSignal, child: AbortController): () => void {
+  if (parent.aborted) {
+    child.abort();
+    return () => {};
+  }
+  const onAbort = () => {
+    child.abort();
+  };
+  parent.addEventListener("abort", onAbort, { once: true });
+  return () => {
+    parent.removeEventListener("abort", onAbort);
+  };
+}
+
+function startIdleWatchdog(params: {
+  accountId: string;
+  runtime: RuntimeEnv;
+  getLastActivityAt: () => number;
+  onIdle: () => void;
+}): () => void {
+  const timer = setInterval(() => {
+    const idleForMs = Date.now() - params.getLastActivityAt();
+    if (idleForMs < OPENZALO_WATCHDOG_IDLE_MS) {
+      return;
+    }
+    params.runtime.error?.(
+      `[${params.accountId}] openzca idle for ${idleForMs}ms; forcing reconnect`,
+    );
+    params.onIdle();
+  }, OPENZALO_WATCHDOG_POLL_MS);
+
+  timer.unref?.();
+  return () => {
+    clearInterval(timer);
+  };
 }
 
 async function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
@@ -222,31 +277,7 @@ export async function monitorOpenzaloProvider(options: OpenzaloMonitorOptions): 
     `[${account.accountId}] starting openzca listener (profile=${account.profile}, binary=${account.zcaBinary})`,
   );
 
-  const ready = await waitForOpenzcaReady({
-    account,
-    runtime,
-    abortSignal,
-  });
-  if (!ready) {
-    return;
-  }
-
   let selfId: string | undefined;
-  try {
-    const me = await runOpenzcaCommand({
-      binary: account.zcaBinary,
-      profile: account.profile,
-      args: ["me", "id"],
-      timeoutMs: 10_000,
-    });
-    const resolved = me.stdout.trim().split(/\s+/g)[0]?.trim();
-    if (resolved) {
-      selfId = resolved;
-      runtime.log?.(`[${account.accountId}] resolved self id ${selfId}`);
-    }
-  } catch (error) {
-    runtime.error?.(`[${account.accountId}] failed to resolve self id: ${String(error)}`);
-  }
 
   const inboundDebouncer = core.channel.debounce.createInboundDebouncer<OpenzaloDebounceEntry>({
     debounceMs: resolveOpenzaloDebounceMs(cfg),
@@ -294,26 +325,121 @@ export async function monitorOpenzaloProvider(options: OpenzaloMonitorOptions): 
     },
   });
 
-  await runOpenzcaStreaming({
-    binary: account.zcaBinary,
-    profile: account.profile,
-    args: ["listen", "--raw", "--keep-alive"],
-    signal: abortSignal,
-    onStderrLine: (line) => {
-      if (!line.trim()) {
+  let reconnectAttempt = 0;
+
+  while (!abortSignal.aborted) {
+    const attemptStartedAt = Date.now();
+    let streamEndedByWatchdog = false;
+    try {
+      const ready = await waitForOpenzcaReady({
+        account,
+        runtime,
+        abortSignal,
+      });
+      if (!ready || abortSignal.aborted) {
         return;
       }
-      runtime.error?.(`[${account.accountId}] openzca stderr: ${line}`);
-    },
-    onJsonLine: async (payload) => {
-      const message = normalizeOpenzcaInboundPayload(payload, selfId);
-      if (!message) {
-        if (payload.kind === "lifecycle" && payload.event === "connected") {
-          runtime.log?.(`[${account.accountId}] openzca connected`);
+
+      if (!selfId) {
+        try {
+          const me = await runOpenzcaCommand({
+            binary: account.zcaBinary,
+            profile: account.profile,
+            args: ["me", "id"],
+            timeoutMs: 10_000,
+            signal: abortSignal,
+          });
+          const resolved = me.stdout.trim().split(/\s+/g)[0]?.trim();
+          if (resolved) {
+            selfId = resolved;
+            runtime.log?.(`[${account.accountId}] resolved self id ${selfId}`);
+          }
+        } catch (error) {
+          runtime.error?.(`[${account.accountId}] failed to resolve self id: ${String(error)}`);
         }
+      }
+
+      const streamAbort = new AbortController();
+      const detachAbort = attachAbort(abortSignal, streamAbort);
+      let lastActivityAt = Date.now();
+      const touchActivity = () => {
+        lastActivityAt = Date.now();
+      };
+      const stopWatchdog = startIdleWatchdog({
+        accountId: account.accountId,
+        runtime,
+        getLastActivityAt: () => lastActivityAt,
+        onIdle: () => {
+          streamEndedByWatchdog = true;
+          streamAbort.abort();
+        },
+      });
+
+      try {
+        await runOpenzcaStreaming({
+          binary: account.zcaBinary,
+          profile: account.profile,
+          args: ["listen", "--raw", "--keep-alive"],
+          signal: streamAbort.signal,
+          onStdoutLine: (line) => {
+            if (line.trim()) {
+              touchActivity();
+            }
+          },
+          onStderrLine: (line) => {
+            if (!line.trim()) {
+              return;
+            }
+            touchActivity();
+            runtime.error?.(`[${account.accountId}] openzca stderr: ${line}`);
+          },
+          onJsonLine: async (payload) => {
+            touchActivity();
+            const message = normalizeOpenzcaInboundPayload(payload, selfId);
+            if (!message) {
+              if (payload.kind === "lifecycle" && payload.event === "connected") {
+                runtime.log?.(`[${account.accountId}] openzca connected`);
+              }
+              return;
+            }
+            await inboundDebouncer.enqueue({ message });
+          },
+        });
+      } finally {
+        stopWatchdog();
+        detachAbort();
+      }
+
+      if (abortSignal.aborted) {
         return;
       }
-      await inboundDebouncer.enqueue({ message });
-    },
-  });
+
+      const attemptDurationMs = Date.now() - attemptStartedAt;
+      reconnectAttempt =
+        attemptDurationMs >= OPENZALO_RECONNECT_STABLE_RESET_MS ? 1 : reconnectAttempt + 1;
+      const delayMs = computeReconnectDelayMs(reconnectAttempt);
+      const reason = streamEndedByWatchdog ? "idle timeout" : "listener exited";
+      runtime.error?.(
+        `[${account.accountId}] openzca ${reason}; reconnecting in ${Math.round(delayMs / 1000)}s`,
+      );
+      await sleepWithAbort(delayMs, abortSignal);
+    } catch (error) {
+      if (abortSignal.aborted) {
+        return;
+      }
+      const attemptDurationMs = Date.now() - attemptStartedAt;
+      reconnectAttempt =
+        attemptDurationMs >= OPENZALO_RECONNECT_STABLE_RESET_MS ? 1 : reconnectAttempt + 1;
+      const delayMs = computeReconnectDelayMs(reconnectAttempt);
+      runtime.error?.(
+        `[${account.accountId}] openzca listener error: ${toErrorText(error)}; ` +
+          `reconnecting in ${Math.round(delayMs / 1000)}s`,
+      );
+      try {
+        await sleepWithAbort(delayMs, abortSignal);
+      } catch {
+        return;
+      }
+    }
+  }
 }

@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 const OPENZALO_OUTBOUND_RECENT_TTL_MS = 15_000;
 const MAX_OPENZALO_OUTBOUND_RECENT_SIGNATURES = 5_000;
 
@@ -27,8 +29,8 @@ const inflightByTicket = new Map<number, OpenzaloOutboundDedupeEntry>();
 const recentBySignature = new Map<string, number>();
 let nextTicketId = 0;
 
-function normalizeChunk(value: string | undefined): string {
-  return (value ?? "").replace(/\s+/g, " ").trim().slice(0, 1024);
+function normalizeIdentity(value: string | undefined): string {
+  return (value ?? "").trim();
 }
 
 function buildSignature(params: {
@@ -38,14 +40,31 @@ function buildSignature(params: {
   kind: "text" | "media";
   text?: string;
   mediaRef?: string;
+  sequence?: number;
 }): string {
-  const accountId = normalizeChunk(params.accountId);
-  const sessionKey = normalizeChunk(params.sessionKey) || "-";
-  const target = normalizeChunk(params.target);
-  const kind = params.kind;
-  const text = normalizeChunk(params.text);
-  const mediaRef = normalizeChunk(params.mediaRef);
-  return [accountId, sessionKey, target, kind, text, mediaRef].join("\u001f");
+  const accountId = normalizeIdentity(params.accountId);
+  const sessionKey = normalizeIdentity(params.sessionKey) || "-";
+  const target = normalizeIdentity(params.target);
+  const sequence =
+    Number.isFinite(params.sequence) && typeof params.sequence === "number"
+      ? String(Math.max(1, Math.floor(params.sequence)))
+      : "1";
+
+  const hash = createHash("sha256");
+  hash.update(accountId, "utf8");
+  hash.update("\u001f", "utf8");
+  hash.update(sessionKey, "utf8");
+  hash.update("\u001f", "utf8");
+  hash.update(target, "utf8");
+  hash.update("\u001f", "utf8");
+  hash.update(params.kind, "utf8");
+  hash.update("\u001f", "utf8");
+  hash.update(sequence, "utf8");
+  hash.update("\u001f", "utf8");
+  hash.update(params.text ?? "", "utf8");
+  hash.update("\u001f", "utf8");
+  hash.update(params.mediaRef ?? "", "utf8");
+  return hash.digest("hex");
 }
 
 function evictRecentOverflow(): void {
@@ -83,6 +102,7 @@ export function acquireOpenzaloOutboundDedupeSlot(
     kind: "text" | "media";
     text?: string;
     mediaRef?: string;
+    sequence?: number;
   },
   nowMs = Date.now(),
 ): AcquireOpenzaloOutboundDedupeResult {
@@ -139,4 +159,3 @@ export function resetOpenzaloOutboundDedupeForTests(): void {
   recentBySignature.clear();
   nextTicketId = 0;
 }
-

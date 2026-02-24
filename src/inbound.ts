@@ -64,6 +64,12 @@ function dedupeStrings(values: readonly string[]): string[] {
   return out;
 }
 
+function nextOpenzaloOutboundSequence(map: Map<string, number>, key: string): number {
+  const next = (map.get(key) ?? 0) + 1;
+  map.set(key, next);
+  return next;
+}
+
 function resolveOpenzaloPendingGroupHistoryLimit(params: {
   accountHistoryLimit?: number;
   globalHistoryLimit?: number;
@@ -252,8 +258,13 @@ async function deliverOpenzaloReply(params: {
 
   if (mediaList.length > 0) {
     let first = true;
+    const mediaSequenceByKey = new Map<string, number>();
     for (const mediaUrl of mediaList) {
       const caption = first ? text : undefined;
+      const sequence = nextOpenzaloOutboundSequence(
+        mediaSequenceByKey,
+        `${caption ?? ""}\u001f${mediaUrl}`,
+      );
       const dedupe = acquireOpenzaloOutboundDedupeSlot({
         accountId: account.accountId,
         sessionKey,
@@ -261,12 +272,12 @@ async function deliverOpenzaloReply(params: {
         kind: "media",
         text: caption,
         mediaRef: mediaUrl,
+        sequence,
       });
       if (!dedupe.acquired) {
         runtime.log?.(
           `[${account.accountId}] openzalo skip duplicate media send (${dedupe.reason}) target=${target}`,
         );
-        first = false;
         continue;
       }
 
@@ -305,14 +316,17 @@ async function deliverOpenzaloReply(params: {
         ? core.channel.text.chunkTextWithMode(text, limit, chunkMode)
         : core.channel.text.chunkMarkdownText(text, limit);
     const finalChunks = chunks.length > 0 ? chunks : [text];
+    const textSequenceByChunk = new Map<string, number>();
 
     for (const chunk of finalChunks) {
+      const sequence = nextOpenzaloOutboundSequence(textSequenceByChunk, chunk);
       const dedupe = acquireOpenzaloOutboundDedupeSlot({
         accountId: account.accountId,
         sessionKey,
         target,
         kind: "text",
         text: chunk,
+        sequence,
       });
       if (!dedupe.acquired) {
         runtime.log?.(

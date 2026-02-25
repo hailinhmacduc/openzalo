@@ -42,6 +42,13 @@ function makeExecError(params: {
   return new Error(`${params.binary} ${params.args.join(" ")} failed: ${detail}`);
 }
 
+function normalizeError(err: unknown): Error {
+  if (err instanceof Error) {
+    return err;
+  }
+  return new Error(typeof err === "string" ? err : String(err));
+}
+
 function parseJsonOutput(text: string): unknown {
   const trimmed = text.trim();
   if (!trimmed) {
@@ -181,6 +188,7 @@ export async function runOpenzcaStreaming(options: OpenzcaStreamingOptions): Pro
     let stdoutRemainder = "";
     let stderrRemainder = "";
     let abortHandler: (() => void) | undefined;
+    let streamHandlerError: unknown;
 
     const emitStdoutLine = async (line: string) => {
       options.onStdoutLine?.(line);
@@ -188,12 +196,14 @@ export async function runOpenzcaStreaming(options: OpenzcaStreamingOptions): Pro
       if (!trimmed) {
         return;
       }
+      let parsed: Record<string, unknown>;
       try {
-        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-        await options.onJsonLine?.(parsed);
+        parsed = JSON.parse(trimmed) as Record<string, unknown>;
       } catch {
         // Non-JSON line from child output; ignore.
+        return;
       }
+      await options.onJsonLine?.(parsed);
     };
 
     const flushRemainder = async () => {
@@ -222,8 +232,13 @@ export async function runOpenzcaStreaming(options: OpenzcaStreamingOptions): Pro
       stdoutRemainder += String(chunk);
       const lines = stdoutRemainder.split(/\r?\n/);
       stdoutRemainder = lines.pop() ?? "";
-      void Promise.all(lines.map((line) => emitStdoutLine(line))).catch(() => {
-        // Parsing/delivery errors are handled in onJsonLine caller; keep stream alive.
+      void Promise.all(lines.map((line) => emitStdoutLine(line))).catch((err) => {
+        if (streamHandlerError) {
+          return;
+        }
+        streamHandlerError = err;
+        child.kill("SIGTERM");
+        setTimeout(() => child.kill("SIGKILL"), 2000).unref();
       });
     });
 
@@ -249,10 +264,16 @@ export async function runOpenzcaStreaming(options: OpenzcaStreamingOptions): Pro
       }
       try {
         await flushRemainder();
-      } catch {
-        // Ignore flush failures.
+      } catch (err) {
+        if (!streamHandlerError) {
+          streamHandlerError = err;
+        }
       }
       const exitCode = code ?? 0;
+      if (streamHandlerError && !options.signal?.aborted) {
+        reject(normalizeError(streamHandlerError));
+        return;
+      }
       if (exitCode !== 0 && !options.signal?.aborted) {
         reject(new Error(`${binary} ${args.join(" ")} exited with code ${exitCode}`));
         return;

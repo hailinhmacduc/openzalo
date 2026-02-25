@@ -291,6 +291,9 @@ export async function monitorOpenzaloProvider(options: OpenzaloMonitorOptions): 
       if (entries.length === 0) {
         return;
       }
+      if (abortSignal.aborted) {
+        return;
+      }
       const message =
         entries.length === 1 ? entries[0].message : combineDebouncedInbound(entries);
 
@@ -311,6 +314,9 @@ export async function monitorOpenzaloProvider(options: OpenzaloMonitorOptions): 
 
       statusSink?.({ lastInboundAt: message.timestamp });
 
+      if (abortSignal.aborted) {
+        return;
+      }
       await handleOpenzaloInbound({
         message,
         account,
@@ -400,6 +406,9 @@ export async function monitorOpenzaloProvider(options: OpenzaloMonitorOptions): 
               if (payload.kind === "lifecycle" && payload.event === "connected") {
                 runtime.log?.(`[${account.accountId}] openzca connected`);
               }
+              return;
+            }
+            if (abortSignal.aborted || streamAbort.signal.aborted) {
               return;
             }
             await inboundDebouncer.enqueue({ message });

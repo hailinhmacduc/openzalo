@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseOpenzaloTarget } from "./normalize.js";
 import { runOpenzcaCommand } from "./openzca.js";
+import { ZcaClient } from "./zca-client.js";
 import { getOpenzaloRuntime } from "./runtime.js";
 import type { CoreConfig, ResolvedOpenzaloAccount } from "./types.js";
 import { parseOpenzcaMessageRefs } from "./message-refs.js";
@@ -265,8 +266,8 @@ async function resolveMediaSource(params: {
   if (blocked.length > 0) {
     throw new Error(
       "OpenZalo local media path is outside allowed roots. " +
-        `Source="${params.source}" Existing candidates: ${blocked.slice(0, 4).join(" | ")}. ` +
-        'Set "channels.openzalo.mediaLocalRoots" (or per-account mediaLocalRoots) to allow more paths.',
+      `Source="${params.source}" Existing candidates: ${blocked.slice(0, 4).join(" | ")}. ` +
+      'Set "channels.openzalo.mediaLocalRoots" (or per-account mediaLocalRoots) to allow more paths.',
     );
   }
 
@@ -367,11 +368,6 @@ export async function sendTextOpenzalo(options: SendTextOptions): Promise<Openza
     return { messageId: "empty", kind: "text" };
   }
 
-  const args = ["msg", "send", target.threadId, body];
-  if (target.isGroup) {
-    args.push("--group");
-  }
-
   logOutbound("info", "sendText request", {
     accountId: account.accountId,
     to,
@@ -379,6 +375,40 @@ export async function sendTextOpenzalo(options: SendTextOptions): Promise<Openza
     isGroup: target.isGroup,
     textLength: body.length,
   });
+
+  // Try zca-js direct API first, fallback to CLI
+  const client = ZcaClient.getInstance({ profile: account.profile });
+  if (client.isConnected) {
+    try {
+      const result = await client.sendText(
+        target.threadId,
+        body,
+        target.isGroup,
+      );
+      logOutbound("info", "sendText success (zca-js)", {
+        accountId: account.accountId,
+        threadId: target.threadId,
+        isGroup: target.isGroup,
+        msgId: result.msgId,
+      });
+      return {
+        messageId: result.messageId,
+        msgId: result.msgId,
+        kind: "text",
+        textPreview: body,
+      };
+    } catch (zcaError) {
+      logOutbound("warn", "sendText zca-js failed, falling back to CLI", {
+        error: String(zcaError),
+      });
+    }
+  }
+
+  // Fallback: original openzca CLI
+  const args = ["msg", "send", target.threadId, body];
+  if (target.isGroup) {
+    args.push("--group");
+  }
 
   try {
     const result = await runOpenzcaCommand({
@@ -388,7 +418,7 @@ export async function sendTextOpenzalo(options: SendTextOptions): Promise<Openza
       timeoutMs: 20_000,
     });
     const refs = parseOpenzcaMessageRefs(result.stdout);
-    logOutbound("info", "sendText success", {
+    logOutbound("info", "sendText success (CLI fallback)", {
       accountId: account.accountId,
       threadId: target.threadId,
       isGroup: target.isGroup,
@@ -557,6 +587,19 @@ export async function sendMediaOpenzalo(
 export async function sendTypingOpenzalo(options: SendTypingOptions): Promise<void> {
   const { account, to } = options;
   const target = parseOpenzaloTarget(to);
+
+  // Try zca-js direct API first
+  const client = ZcaClient.getInstance({ profile: account.profile });
+  if (client.isConnected) {
+    try {
+      await client.sendTyping(target.threadId, target.isGroup);
+      return;
+    } catch {
+      // Fall through to CLI
+    }
+  }
+
+  // Fallback: original openzca CLI
   const args = ["msg", "typing", target.threadId];
   if (target.isGroup) {
     args.push("--group");

@@ -5,6 +5,7 @@ import { runOpenzcaCommand, runOpenzcaStreaming } from "./openzca.js";
 import { normalizeOpenzcaInboundPayload } from "./monitor-normalize.js";
 import type { CoreConfig, OpenzaloInboundMessage, ResolvedOpenzaloAccount } from "./types.js";
 import { dedupeStrings } from "./utils/dedupe-strings.js";
+import { ZcaClient, type ZcaInboundMessage } from "./zca-client.js";
 
 type OpenzaloMonitorOptions = {
   account: ResolvedOpenzaloAccount;
@@ -56,7 +57,7 @@ function nextReconnectAttempt(currentAttempt: number, attemptDurationMs: number)
 function attachAbort(parent: AbortSignal, child: AbortController): () => void {
   if (parent.aborted) {
     child.abort();
-    return () => {};
+    return () => { };
   }
   const onAbort = () => {
     child.abort();
@@ -257,6 +258,138 @@ function buildOpenzaloDebounceKey(params: {
   ].join(":");
 }
 
+/**
+ * Convert a ZcaInboundMessage from zca-js to the OpenzaloInboundMessage format
+ * expected by the existing inbound pipeline.
+ */
+function normalizeZcaJsMessage(msg: ZcaInboundMessage): OpenzaloInboundMessage {
+  return {
+    messageId: msg.messageId,
+    msgId: msg.msgId,
+    cliMsgId: msg.cliMsgId,
+    threadId: msg.threadId,
+    senderId: msg.senderId,
+    senderName: msg.senderName,
+    text: msg.text,
+    timestamp: msg.timestamp,
+    isGroup: msg.isGroup,
+    mediaPaths: msg.mediaPaths,
+    mediaUrls: [],
+    mediaTypes: msg.mediaTypes,
+    mentionIds: [],
+    raw: msg.rawMessage as unknown as Record<string, unknown>,
+  };
+}
+
+/**
+ * Monitor via zca-js direct library integration.
+ * Uses persistent WebSocket — no subprocess spawning, no 30min recycles.
+ * Returns true if successfully started (caller should wait for abort), false to fall through to CLI.
+ */
+async function monitorViaZcaJs(options: OpenzaloMonitorOptions): Promise<boolean> {
+  const { account, cfg, runtime, abortSignal, statusSink } = options;
+  const core = getOpenzaloRuntime();
+
+  const logger = {
+    info: (msg: string, meta?: Record<string, unknown>) =>
+      runtime.log?.(`[${account.accountId}] zca-js: ${msg}`),
+    warn: (msg: string, meta?: Record<string, unknown>) =>
+      runtime.error?.(`[${account.accountId}] zca-js warn: ${msg}`),
+    error: (msg: string, meta?: Record<string, unknown>) =>
+      runtime.error?.(`[${account.accountId}] zca-js error: ${msg}`),
+  };
+
+  const inboundDebouncer = core.channel.debounce.createInboundDebouncer<OpenzaloDebounceEntry>({
+    debounceMs: resolveOpenzaloDebounceMs(cfg),
+    buildKey: (entry) =>
+      buildOpenzaloDebounceKey({
+        accountId: account.accountId,
+        message: entry.message,
+      }),
+    shouldDebounce: () => true,
+    onFlush: async (entries) => {
+      if (entries.length === 0 || abortSignal.aborted) return;
+      const message =
+        entries.length === 1 ? entries[0].message : combineDebouncedInbound(entries);
+
+      core.channel.activity.record({
+        channel: "openzalo",
+        accountId: account.accountId,
+        direction: "inbound",
+        at: message.timestamp,
+      });
+      statusSink?.({ lastInboundAt: message.timestamp });
+
+      if (abortSignal.aborted) return;
+      await handleOpenzaloInbound({
+        message,
+        account,
+        cfg,
+        runtime,
+        botUserId: client.selfId || undefined,
+        statusSink,
+      });
+    },
+    onError: (error) => {
+      runtime.error?.(`[${account.accountId}] zca-js debounce flush failed: ${String(error)}`);
+    },
+  });
+
+  const client = ZcaClient.getInstance({
+    profile: account.profile,
+    logger,
+    onMessage: async (msg: ZcaInboundMessage) => {
+      if (msg.isSelf || abortSignal.aborted) return;
+      const normalized = normalizeZcaJsMessage(msg);
+      await inboundDebouncer.enqueue({ message: normalized });
+    },
+    onDisconnect: () => {
+      runtime.error?.(`[${account.accountId}] zca-js listener disconnected`);
+    },
+    onReconnect: () => {
+      runtime.log?.(`[${account.accountId}] zca-js listener reconnected`);
+    },
+  });
+
+  try {
+    runtime.log?.(`[${account.accountId}] attempting zca-js login (profile=${account.profile})`);
+    await client.login();
+    runtime.log?.(`[${account.accountId}] zca-js logged in (selfId=${client.selfId})`);
+  } catch (err) {
+    runtime.error?.(
+      `[${account.accountId}] zca-js login failed: ${String(err)}; falling back to CLI`,
+    );
+    ZcaClient.removeInstance(account.profile);
+    return false;
+  }
+
+  try {
+    await client.startListener();
+    runtime.log?.(`[${account.accountId}] zca-js listener started — persistent WebSocket active`);
+  } catch (err) {
+    runtime.error?.(
+      `[${account.accountId}] zca-js listener start failed: ${String(err)}; falling back to CLI`,
+    );
+    ZcaClient.removeInstance(account.profile);
+    return false;
+  }
+
+  // Wait for abort signal (the listener runs in zca-js's event loop)
+  await new Promise<void>((resolve) => {
+    if (abortSignal.aborted) {
+      resolve();
+      return;
+    }
+    abortSignal.addEventListener("abort", () => {
+      client.stop();
+      ZcaClient.removeInstance(account.profile);
+      resolve();
+    }, { once: true });
+  });
+
+  return true;
+}
+
 export async function monitorOpenzaloProvider(options: OpenzaloMonitorOptions): Promise<void> {
   const { account, cfg, runtime, abortSignal, statusSink } = options;
   const core = getOpenzaloRuntime();
@@ -264,6 +397,22 @@ export async function monitorOpenzaloProvider(options: OpenzaloMonitorOptions): 
   runtime.log?.(
     `[${account.accountId}] starting openzca listener (profile=${account.profile}, binary=${account.zcaBinary})`,
   );
+
+  // ── Try zca-js direct integration first ────────────────────────────────
+  try {
+    const started = await monitorViaZcaJs(options);
+    if (started) {
+      runtime.log?.(`[${account.accountId}] zca-js monitor completed`);
+      return;
+    }
+  } catch (err) {
+    runtime.error?.(
+      `[${account.accountId}] zca-js monitor failed: ${String(err)}; falling back to CLI`,
+    );
+  }
+
+  // ── Fallback: original openzca CLI streaming ──────────────────────────
+  runtime.log?.(`[${account.accountId}] using openzca CLI fallback listener`);
 
   let selfId: string | undefined;
 
@@ -288,8 +437,8 @@ export async function monitorOpenzaloProvider(options: OpenzaloMonitorOptions): 
       if (entries.length > 1 && core.logging.shouldLogVerbose()) {
         runtime.log?.(
           `[${account.accountId}] openzalo coalesced ${entries.length} inbound events ` +
-            `thread=${message.threadId} sender=${message.senderId} ` +
-            `textLen=${message.text.length} media=${message.mediaPaths.length + message.mediaUrls.length}`,
+          `thread=${message.threadId} sender=${message.senderId} ` +
+          `textLen=${message.text.length} media=${message.mediaPaths.length + message.mediaUrls.length}`,
         );
       }
 
@@ -428,7 +577,7 @@ export async function monitorOpenzaloProvider(options: OpenzaloMonitorOptions): 
       const delayMs = computeReconnectDelayMs(reconnectAttempt);
       runtime.error?.(
         `[${account.accountId}] openzca listener error: ${toErrorText(error)}; ` +
-          `reconnecting in ${Math.round(delayMs / 1000)}s`,
+        `reconnecting in ${Math.round(delayMs / 1000)}s`,
       );
       try {
         await sleepWithAbort(delayMs, abortSignal);
